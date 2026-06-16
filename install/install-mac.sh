@@ -41,12 +41,34 @@ else
   echo "   - drop a prebuilt signed hearken.app into $REPO/build/bin/ (from a GitHub release)."
 fi
 
-say "5/5  Done — finish by hand"
+say "5/6  Install login agent (headless daemon + menubar icon)"
+PLIST="$HOME/Library/LaunchAgents/com.hearken.daemon.plist"
+APP_BIN="$REPO/build/bin/hearken.app/Contents/MacOS/hearken"
+cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.hearken.daemon</string>
+  <key>ProgramArguments</key><array><string>$APP_BIN</string></array>
+  <key>RunAtLoad</key><true/>
+  <!-- restart only on crash, so the tray "Quit" actually stays quit -->
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>LimitLoadToSessionType</key><string>Aqua</string>
+</dict>
+</plist>
+EOF
+launchctl unload "$PLIST" 2>/dev/null || true
+launchctl load "$PLIST" && echo "  loaded com.hearken.daemon (starts at login; runs headless with a menubar icon)"
+
+say "6/6  Done — finish by hand"
 TSIP="$(/opt/homebrew/bin/tailscale ip -4 2>/dev/null || echo '(install + log in to Tailscale)')"
 LANIP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo 'n/a')"
 cat <<EOF
-  • Launch:  open "$REPO/build/bin/hearken.app"
-  • Click "Allow" on the microphone prompt — ONE time (the cert makes it stick).
+  • The daemon is now running headless with a hearken icon in the menubar.
+  • Click the menubar icon -> "Open hearken" to configure; click "Allow" on the
+    microphone prompt ONCE (the cert makes it persist).
   • This Mac defaults to HOST (it listens); the other device dials in.
   • Give the other device THIS machine's address:
         Tailscale: $TSIP

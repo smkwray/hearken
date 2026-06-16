@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -35,6 +38,8 @@ import (
 const hearPort = 45000
 const talkPort = 45001
 const blackholeUID = "BlackHole2ch_UID"
+const daemonAddr = "127.0.0.1:47600" // headless daemon's local control API
+const daemonURL = "http://" + daemonAddr
 
 type Config struct {
 	PeerIP    string `json:"peerIP"`
@@ -115,27 +120,62 @@ type App struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 	note   string
+	daemon string       // "" = run the bridge locally (daemon mode); non-"" = proxy to that URL (window mode)
+	hc     *http.Client // window mode HTTP client
 }
 
+// NewApp creates the daemon-mode App that actually owns the bridge.
 func NewApp() *App {
 	a := &App{cfg: defaultConfig()}
 	a.cfg = a.loadConfig()
 	return a
 }
 
-func (a *App) startup(ctx context.Context) {
-	a.ctx = ctx
+// NewWindowApp creates the window-mode App: a thin proxy that forwards every
+// bound call to the headless daemon over its local HTTP API. The frontend and
+// Wails bindings are identical to daemon mode — only the implementation differs.
+func NewWindowApp(url string) *App {
+	return &App{daemon: url, hc: &http.Client{Timeout: 8 * time.Second}}
+}
+
+// rpc forwards a method call to the daemon and returns its raw JSON result.
+func (a *App) rpc(method string, args ...any) json.RawMessage {
+	body, _ := json.Marshal(map[string]any{"M": method, "A": args})
+	resp, err := a.hc.Post(a.daemon+"/rpc", "application/json", bytes.NewReader(body))
+	if err != nil {
+		logf("window rpc %s failed: %v", method, err)
+		return nil
+	}
+	defer resp.Body.Close()
+	var out struct {
+		R json.RawMessage `json:"r"`
+	}
+	json.NewDecoder(resp.Body).Decode(&out)
+	return out.R
+}
+
+// startup is the Wails hook for WINDOW mode — a thin client. The daemon owns the
+// bridge, so this only stores the context; it must NOT auto-start anything.
+func (a *App) startup(ctx context.Context) { a.ctx = ctx }
+
+// shutdown: closing the config window must NOT stop the daemon's bridge.
+func (a *App) shutdown(ctx context.Context) {
+	if a.daemon == "" {
+		a.Stop() // only relevant if ever run standalone
+	}
+}
+
+// autoStart launches the bridge if configured. Called by the DAEMON at startup
+// (host always; client once a peer IP is set).
+func (a *App) autoStart() {
 	deps := a.CheckDeps()
-	logf("startup os=%s home=%s abDir=%s autostart=%v deps=%v", runtime.GOOS, home(), abDir(), a.cfg.AutoStart, deps)
-	// Auto-start if deps are present and (host, or client with a peer set).
+	logf("daemon startup os=%s home=%s abDir=%s autostart=%v deps=%v", runtime.GOOS, home(), abDir(), a.cfg.AutoStart, deps)
 	if a.cfg.AutoStart && len(deps) == 0 {
 		if isHost(a.cfg) || a.cfg.PeerIP != "" {
 			go a.Start()
 		}
 	}
 }
-
-func (a *App) shutdown(ctx context.Context) { a.Stop() }
 
 // ---- paths / helpers ----------------------------------------------------
 
@@ -270,6 +310,11 @@ type PeerInfo struct {
 }
 
 func (a *App) GetStatus() Status {
+	if a.daemon != "" {
+		var s Status
+		json.Unmarshal(a.rpc("GetStatus"), &s)
+		return s
+	}
 	a.mu.Lock()
 	cfg := a.cfg
 	active := a.active
@@ -294,8 +339,9 @@ func (a *App) GetStatus() Status {
 		s.BlackHole, s.BridgeOut = true, true // n/a on Windows
 	}
 	if isHost(cfg) {
-		s.HearUp = portListening(hearPort)             // serving host audio
-		s.TalkUp = portListening(talkPort)             // listening for client audio
+		// green while listening OR while a peer is connected (streaming)
+		s.HearUp = portListening(hearPort) || portEstablished(hearPort)
+		s.TalkUp = portListening(talkPort) || portEstablished(talkPort)
 		s.PeerConnected = portEstablished(hearPort) || portEstablished(talkPort)
 	} else {
 		s.HearUp = connEstablishedToPeer(cfg.PeerIP, hearPort)
@@ -374,42 +420,104 @@ func probeHearken(ip string, timeout time.Duration) bool {
 // DiscoverPeers lists online Tailscale peers with a hearken host port open — i.e.
 // hosts this machine can connect to. Bound for the UI "Scan" button.
 func (a *App) DiscoverPeers() []PeerInfo {
-	out, err := run(6*time.Second, tailscaleBin(), "status", "--json")
-	if err != nil {
-		logf("discover: tailscale status failed: %v", err)
-		return []PeerInfo{}
+	if a.daemon != "" {
+		var p []PeerInfo
+		json.Unmarshal(a.rpc("DiscoverPeers"), &p)
+		return p
 	}
-	var st tsStatus
-	if e := json.Unmarshal([]byte(out), &st); e != nil {
-		logf("discover: parse failed: %v", e)
-		return []PeerInfo{}
+	type cand struct{ ip, name, os string }
+	selfTS, selfLAN := selfIPs()
+	self := map[string]bool{}
+	if selfTS != "" {
+		self[selfTS] = true
 	}
-	selfTS, _ := selfIPs()
+	if selfLAN != "" {
+		self[selfLAN] = true
+	}
+	seen := map[string]bool{}
+	var cands []cand
+
+	// 1) Tailscale peers (carry hostnames/OS)
+	if out, err := run(6*time.Second, tailscaleBin(), "status", "--json"); err == nil {
+		var st tsStatus
+		if json.Unmarshal([]byte(out), &st) == nil {
+			for _, peer := range st.Peer {
+				if !peer.Online {
+					continue
+				}
+				ip := firstIPv4(peer.TailscaleIPs)
+				if ip == "" || self[ip] || seen[ip] {
+					continue
+				}
+				seen[ip] = true
+				cands = append(cands, cand{ip, peer.HostName, peer.OS})
+			}
+		}
+	}
+	// 2) LAN subnet hosts (no Tailscale needed)
+	for _, ip := range lanCandidates() {
+		if self[ip] || seen[ip] {
+			continue
+		}
+		seen[ip] = true
+		cands = append(cands, cand{ip, "", ""})
+	}
+
+	// Probe every candidate for an open hearken port, bounded concurrency.
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	found := []PeerInfo{}
-	for _, peer := range st.Peer {
-		if !peer.Online {
-			continue
-		}
-		ip := firstIPv4(peer.TailscaleIPs)
-		if ip == "" || ip == selfTS {
-			continue
-		}
+	sem := make(chan struct{}, 128)
+	for _, c := range cands {
 		wg.Add(1)
-		go func(pr tsPeer, ip string) {
+		sem <- struct{}{}
+		go func(c cand) {
 			defer wg.Done()
-			if probeHearken(ip, 500*time.Millisecond) {
+			defer func() { <-sem }()
+			if probeHearken(c.ip, 500*time.Millisecond) {
+				name := c.name
+				if name == "" {
+					name = "LAN host"
+				}
 				mu.Lock()
-				found = append(found, PeerInfo{IP: ip, Name: pr.HostName, OS: pr.OS})
+				found = append(found, PeerInfo{IP: c.ip, Name: name, OS: c.os})
 				mu.Unlock()
 			}
-		}(peer, ip)
+		}(c)
 	}
 	wg.Wait()
-	sort.Slice(found, func(i, j int) bool { return found[i].Name < found[j].Name })
-	logf("discover: %d hearken host(s) found", len(found))
+	sort.Slice(found, func(i, j int) bool { return found[i].IP < found[j].IP })
+	logf("discover: %d hearken host(s) found of %d candidates", len(found), len(cands))
 	return found
+}
+
+// lanCandidates returns every host IP on this machine's private /24-or-smaller
+// subnets (for hearken discovery without Tailscale).
+func lanCandidates() []string {
+	var out []string
+	addrs, _ := net.InterfaceAddrs()
+	for _, a := range addrs {
+		ipnet, ok := a.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		ip4 := ipnet.IP.To4()
+		if ip4 == nil || !ip4.IsPrivate() {
+			continue
+		}
+		ones, bits := ipnet.Mask.Size()
+		if bits != 32 || ones < 24 { // only scan subnets up to 256 addresses
+			continue
+		}
+		base := binary.BigEndian.Uint32(ip4.Mask(ipnet.Mask))
+		count := uint32(1) << uint(32-ones)
+		for i := uint32(1); i < count-1; i++ { // skip network + broadcast
+			c := make(net.IP, 4)
+			binary.BigEndian.PutUint32(c, base+i)
+			out = append(out, c.String())
+		}
+	}
+	return out
 }
 
 // ---- start / stop (process supervision) --------------------------------
@@ -628,18 +736,38 @@ func (a *App) disableLegacyServices() {
 		uid := strconv.Itoa(os.Getuid())
 		run(5*time.Second, "launchctl", "bootout", "gui/"+uid+"/com.shane.audiobridge.hear")
 		run(5*time.Second, "launchctl", "bootout", "gui/"+uid+"/com.shane.audiobridge.talk")
+		// sweep orphaned bridge children from a previously crashed/killed daemon
+		run(3*time.Second, "pkill", "-f", "hear-capture "+strconv.Itoa(hearPort))
+		run(3*time.Second, "pkill", "-f", fmt.Sprintf("tcp://0.0.0.0:%d?listen=1", talkPort))
 	} else {
 		run(8*time.Second, "schtasks", "/End", "/TN", "HearMac")
 		run(8*time.Second, "schtasks", "/Change", "/TN", "HearMac", "/DISABLE")
 		run(5*time.Second, "taskkill", "/IM", "ffplay.exe", "/F")
+		// sweep orphaned bridge children from a previously crashed/killed daemon
+		run(5*time.Second, "taskkill", "/IM", "play.exe", "/F")
+		run(5*time.Second, "taskkill", "/IM", "capture.exe", "/F")
 	}
 }
 
 // ---- config-changing bound methods -------------------------------------
 
-func (a *App) GetConfig() Config { a.mu.Lock(); defer a.mu.Unlock(); return a.cfg }
+func (a *App) GetConfig() Config {
+	if a.daemon != "" {
+		var c Config
+		json.Unmarshal(a.rpc("GetConfig"), &c)
+		return c
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.cfg
+}
 
 func (a *App) SetPeerIP(ip string) string {
+	if a.daemon != "" {
+		var r string
+		json.Unmarshal(a.rpc("SetPeerIP", ip), &r)
+		return r
+	}
 	a.mu.Lock()
 	a.cfg.PeerIP = strings.TrimSpace(ip)
 	a.saveConfig()
@@ -648,6 +776,11 @@ func (a *App) SetPeerIP(ip string) string {
 }
 
 func (a *App) SetDirection(dir string) string {
+	if a.daemon != "" {
+		var r string
+		json.Unmarshal(a.rpc("SetDirection", dir), &r)
+		return r
+	}
 	a.mu.Lock()
 	a.cfg.Direction = dir
 	a.saveConfig()
@@ -658,6 +791,11 @@ func (a *App) SetDirection(dir string) string {
 // SetRole switches whether this machine is the host (listens) or client (dials).
 // "" (or anything else) = auto: host on macOS, client elsewhere.
 func (a *App) SetRole(r string) string {
+	if a.daemon != "" {
+		var res string
+		json.Unmarshal(a.rpc("SetRole", r), &res)
+		return res
+	}
 	a.mu.Lock()
 	if r != "host" && r != "client" {
 		r = ""
@@ -669,6 +807,11 @@ func (a *App) SetRole(r string) string {
 }
 
 func (a *App) ApplyParams(sndKB, captureMs, recvKB int) string {
+	if a.daemon != "" {
+		var r string
+		json.Unmarshal(a.rpc("ApplyParams", sndKB, captureMs, recvKB), &r)
+		return r
+	}
 	a.mu.Lock()
 	if sndKB >= 4 {
 		a.cfg.SndBufKB = sndKB
@@ -686,6 +829,11 @@ func (a *App) ApplyParams(sndKB, captureMs, recvKB int) string {
 
 // SetVolume sets this device's playback gain (0-100) and restarts the bridge.
 func (a *App) SetVolume(pct int) string {
+	if a.daemon != "" {
+		var r string
+		json.Unmarshal(a.rpc("SetVolume", pct), &r)
+		return r
+	}
 	a.mu.Lock()
 	if pct < 0 {
 		pct = 0
@@ -700,6 +848,11 @@ func (a *App) SetVolume(pct int) string {
 }
 
 func (a *App) SetAutoStart(on bool) string {
+	if a.daemon != "" {
+		var r string
+		json.Unmarshal(a.rpc("SetAutoStart", on), &r)
+		return r
+	}
 	a.mu.Lock()
 	a.cfg.AutoStart = on
 	a.saveConfig()
@@ -709,6 +862,11 @@ func (a *App) SetAutoStart(on bool) string {
 
 // Toggle starts or stops the bridge.
 func (a *App) Toggle() string {
+	if a.daemon != "" {
+		var r string
+		json.Unmarshal(a.rpc("Toggle"), &r)
+		return r
+	}
 	a.mu.Lock()
 	on := a.active
 	a.mu.Unlock()
@@ -731,6 +889,11 @@ func (a *App) restart() string {
 
 // Verify pings the peer and checks for an active stream.
 func (a *App) Verify() string {
+	if a.daemon != "" {
+		var r string
+		json.Unmarshal(a.rpc("Verify"), &r)
+		return r
+	}
 	a.mu.Lock()
 	cfg := a.cfg
 	a.mu.Unlock()
