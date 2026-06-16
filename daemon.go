@@ -13,11 +13,11 @@ import (
 	"fyne.io/systray"
 )
 
-//go:embed build/appicon.png
-var trayIconPNG []byte
+//go:embed assets/menubar-glyph.png
+var menubarGlyph []byte // black elephant silhouette (macOS template — auto light/dark)
 
-//go:embed build/windows/icon.ico
-var trayIconICO []byte
+//go:embed assets/tray-glyph.ico
+var trayGlyphICO []byte // teal elephant silhouette (Windows taskbar)
 
 // runDaemon is the default (headless) mode: it owns the bridge, serves a local
 // control API for the window, and shows a tray/menubar icon. No WebView.
@@ -87,7 +87,7 @@ func (a *App) dispatch(m string, args []json.RawMessage) any {
 	case "SetVolume":
 		return a.SetVolume(n(0))
 	case "ApplyParams":
-		return a.ApplyParams(n(0), n(1), n(2))
+		return a.ApplyParams(n(0), n(1), n(2), n(3))
 	case "Toggle":
 		return a.Toggle()
 	case "Verify":
@@ -112,9 +112,9 @@ func openWindow() {
 func runTray(app *App) {
 	onReady := func() {
 		if runtime.GOOS == "windows" {
-			systray.SetIcon(trayIconICO)
+			systray.SetIcon(trayGlyphICO)
 		} else {
-			systray.SetIcon(trayIconPNG)
+			systray.SetTemplateIcon(menubarGlyph, menubarGlyph) // macOS adapts to light/dark
 		}
 		systray.SetTooltip("hearken")
 		mStatus := systray.AddMenuItem("starting…", "")

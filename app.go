@@ -49,12 +49,25 @@ type Config struct {
 	SndBufKB  int    `json:"sndBufKB"`
 	CaptureMs int    `json:"captureMs"`
 	RecvBufKB int    `json:"recvBufKB"`
+	PlayoutMs int    `json:"playoutMs"` // playout jitter-buffer cap (ms) — the main crackle vs latency knob
 	VolumePct int    `json:"volumePct"` // playback gain on THIS device, 0-100 (100 = unity)
 	AutoStart bool   `json:"autoStart"`
 }
 
 func defaultConfig() Config {
-	return Config{PeerIP: "", Role: "", Direction: "both", SndBufKB: 16, CaptureMs: 21, RecvBufKB: 16, VolumePct: 100, AutoStart: true}
+	return Config{PeerIP: "", Role: "", Direction: "both", SndBufKB: 16, CaptureMs: 21, RecvBufKB: 16, PlayoutMs: 250, VolumePct: 100, AutoStart: true}
+}
+
+// playoutArg renders the playout buffer cap (ms, clamped 80-800) for play.exe.
+func playoutArg(cfg Config) string {
+	v := cfg.PlayoutMs
+	if v < 80 {
+		v = 80
+	}
+	if v > 800 {
+		v = 800
+	}
+	return strconv.Itoa(v)
 }
 
 // gainArg renders this device's playback gain (0.000–1.000) for play.exe / ffmpeg.
@@ -293,6 +306,7 @@ type Status struct {
 	SndBufKB      int      `json:"sndBufKB"`
 	CaptureMs     int      `json:"captureMs"`
 	RecvBufKB     int      `json:"recvBufKB"`
+	PlayoutMs     int      `json:"playoutMs"`
 	VolumePct     int      `json:"volumePct"`
 	AutoStart     bool     `json:"autoStart"`
 	MissingDeps   []string `json:"missingDeps"`
@@ -325,7 +339,7 @@ func (a *App) GetStatus() Status {
 	s := Status{
 		OS: runtime.GOOS, PeerIP: cfg.PeerIP, Active: active, PingMs: -1,
 		Direction: cfg.Direction, SndBufKB: cfg.SndBufKB, CaptureMs: cfg.CaptureMs,
-		RecvBufKB: cfg.RecvBufKB, VolumePct: cfg.VolumePct, AutoStart: cfg.AutoStart,
+		RecvBufKB: cfg.RecvBufKB, PlayoutMs: cfg.PlayoutMs, VolumePct: cfg.VolumePct, AutoStart: cfg.AutoStart,
 		MissingDeps: a.CheckDeps(), Note: note,
 	}
 	s.Role = roleName(cfg)
@@ -680,7 +694,7 @@ func (a *App) buildCmd(ctx context.Context, r role, cfg Config) *exec.Cmd {
 		if !mac {
 			// play.exe (NAudio/WASAPI) plays to the CURRENT default device and
 			// re-binds on default-device change (BT headphones, device switch).
-			return exec.CommandContext(ctx, playExe(), cfg.PeerIP, strconv.Itoa(hearPort), gainArg(cfg))
+			return exec.CommandContext(ctx, playExe(), cfg.PeerIP, strconv.Itoa(hearPort), gainArg(cfg), playoutArg(cfg))
 		}
 		// Mac client: ffmpeg dials the host and plays to the real output device.
 		return ffmpegPlay(ctx, fmt.Sprintf("tcp://%s:%d", cfg.PeerIP, hearPort), a.realOutputIndex(), gainArg(cfg))
@@ -807,10 +821,10 @@ func (a *App) SetRole(r string) string {
 	return a.restart()
 }
 
-func (a *App) ApplyParams(sndKB, captureMs, recvKB int) string {
+func (a *App) ApplyParams(sndKB, captureMs, recvKB, playoutMs int) string {
 	if a.daemon != "" {
 		var r string
-		json.Unmarshal(a.rpc("ApplyParams", sndKB, captureMs, recvKB), &r)
+		json.Unmarshal(a.rpc("ApplyParams", sndKB, captureMs, recvKB, playoutMs), &r)
 		return r
 	}
 	a.mu.Lock()
@@ -822,6 +836,9 @@ func (a *App) ApplyParams(sndKB, captureMs, recvKB int) string {
 	}
 	if recvKB >= 4 {
 		a.cfg.RecvBufKB = recvKB
+	}
+	if playoutMs >= 50 {
+		a.cfg.PlayoutMs = playoutMs
 	}
 	a.saveConfig()
 	a.mu.Unlock()

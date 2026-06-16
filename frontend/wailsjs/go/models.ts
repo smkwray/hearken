@@ -7,6 +7,7 @@ export namespace main {
 	    sndBufKB: number;
 	    captureMs: number;
 	    recvBufKB: number;
+	    playoutMs: number;
 	    volumePct: number;
 	    autoStart: boolean;
 	
@@ -22,6 +23,7 @@ export namespace main {
 	        this.sndBufKB = source["sndBufKB"];
 	        this.captureMs = source["captureMs"];
 	        this.recvBufKB = source["recvBufKB"];
+	        this.playoutMs = source["playoutMs"];
 	        this.volumePct = source["volumePct"];
 	        this.autoStart = source["autoStart"];
 	    }
@@ -58,6 +60,7 @@ export namespace main {
 	    sndBufKB: number;
 	    captureMs: number;
 	    recvBufKB: number;
+	    playoutMs: number;
 	    volumePct: number;
 	    autoStart: boolean;
 	    missingDeps: string[];
@@ -88,6 +91,7 @@ export namespace main {
 	        this.sndBufKB = source["sndBufKB"];
 	        this.captureMs = source["captureMs"];
 	        this.recvBufKB = source["recvBufKB"];
+	        this.playoutMs = source["playoutMs"];
 	        this.volumePct = source["volumePct"];
 	        this.autoStart = source["autoStart"];
 	        this.missingDeps = source["missingDeps"];

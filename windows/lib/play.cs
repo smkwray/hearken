@@ -23,6 +23,8 @@ namespace AudioBridge {
     static volatile bool deviceChanged;
     static readonly WaveFormat SourceFmt = new WaveFormat(48000, 16, 2);
     static float gGain = 1.0f;             // playback gain 0.0-1.0 (arg 3), applied to PCM
+    static int gPlayoutMs = 250;           // playout jitter-buffer cap in ms (arg 4)
+    const int BytesPerMs = 192;            // 48000 * 2ch * 2bytes / 1000
 
     public void OnDefaultDeviceChanged(DataFlow flow, Role role, string id) {
       if (flow == DataFlow.Render) deviceChanged = true;
@@ -37,6 +39,7 @@ namespace AudioBridge {
       string host = args.Length > 0 ? args[0] : "127.0.0.1";
       int port = args.Length > 1 ? int.Parse(args[1]) : 45000;
       if (args.Length > 2) { float g; if (float.TryParse(args[2], out g)) gGain = g < 0 ? 0 : (g > 1 ? 1 : g); }
+      if (args.Length > 3) { int p; if (int.TryParse(args[3], out p)) gPlayoutMs = p < 80 ? 80 : (p > 800 ? 800 : p); }
       try { MediaFoundationApi.Startup(); } catch {}
       notifier = new Play();
       try { en.RegisterEndpointNotificationCallback(notifier); } catch {}
@@ -110,7 +113,7 @@ namespace AudioBridge {
         if (e.Exception != null) Console.Error.WriteLine("stopped: " + e.Exception.Message);
         deviceChanged = true;
       };
-      wo.Init(new LatencyCap(netBuf, 48000)); // cap playout latency ~250ms (drop oldest on bloat)
+      wo.Init(new LatencyCap(netBuf, gPlayoutMs * BytesPerMs)); // cap playout latency (drop oldest on bloat)
       wo.Play();
       BindAndUnmute(dev);
       Console.Error.WriteLine("playing WASAPI shared, state=" + wo.PlaybackState);
@@ -169,7 +172,7 @@ namespace AudioBridge {
           if (gGain != 1.0f) ApplyGain(tmp, n, gGain);
           buf.AddSamples(tmp, 0, n);
           total += n;
-          if (chain == null && buf.BufferedDuration >= TimeSpan.FromMilliseconds(150)) {
+          if (chain == null && buf.BufferedDuration >= TimeSpan.FromMilliseconds(gPlayoutMs * 0.6)) {
             deviceChanged = false;
             chain = OpenDefault(buf); // open AFTER prebuffer so first buffers are real audio
           } else if (chain != null && (deviceChanged || chain.Out.PlaybackState == PlaybackState.Stopped)) {

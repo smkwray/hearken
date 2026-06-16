@@ -47,9 +47,10 @@ app.innerHTML = `
 
     <div class="section">
       <div class="sec-h">Latency <span class="hint">lower = less delay, may crackle</span></div>
-      <label class="slider"><span class="lbl">Send buffer</span><input type="range" id="snd" min="4" max="128" step="4"><span class="val" id="snd-v"></span></label>
-      <label class="slider"><span class="lbl">Capture</span><input type="range" id="cap" min="3" max="30" step="1"><span class="val" id="cap-v"></span></label>
-      <label class="slider"><span class="lbl">Recv buffer</span><input type="range" id="recv" min="4" max="128" step="4"><span class="val" id="recv-v"></span></label>
+      <label class="slider" title="Jitter cushion on the listener — raise this first if you hear crackling"><span class="lbl">Playout buffer</span><input type="range" id="playout" min="80" max="500" step="20"><span class="val" id="playout-v"></span></label>
+      <label class="slider" title="Chunk size the source captures"><span class="lbl">Capture</span><input type="range" id="cap" min="3" max="30" step="1"><span class="val" id="cap-v"></span></label>
+      <label class="slider" title="TCP send socket buffer (advanced)"><span class="lbl">Send buffer</span><input type="range" id="snd" min="4" max="128" step="4"><span class="val" id="snd-v"></span></label>
+      <label class="slider" title="TCP receive socket buffer (advanced)"><span class="lbl">Recv buffer</span><input type="range" id="recv" min="4" max="128" step="4"><span class="val" id="recv-v"></span></label>
     </div>
 
     <div class="actions">
@@ -65,13 +66,13 @@ app.innerHTML = `
 const $ = (id) => document.getElementById(id);
 const setPill = (el, ok, na) => { el.classList.toggle('ok', !!ok && !na); el.classList.toggle('na', !!na); el.classList.toggle('bad', !ok && !na); };
 const msg = (t) => { $('msg').textContent = t; };
-const sv = () => { $('snd-v').textContent = $('snd').value + ' KB'; $('cap-v').textContent = $('cap').value + ' ms'; $('recv-v').textContent = $('recv').value + ' KB'; };
-['snd', 'cap', 'recv'].forEach((id) => $(id).addEventListener('input', sv));
+const sv = () => { $('playout-v').textContent = $('playout').value + ' ms'; $('snd-v').textContent = $('snd').value + ' KB'; $('cap-v').textContent = $('cap').value + ' ms'; $('recv-v').textContent = $('recv').value + ' KB'; };
+['playout', 'snd', 'cap', 'recv'].forEach((id) => $(id).addEventListener('input', sv));
 
 let isWin = false, ipFocused = false, touched = false;
 $('ip').addEventListener('focus', () => ipFocused = true);
 $('ip').addEventListener('blur', () => ipFocused = false);
-['snd', 'cap', 'recv'].forEach((id) => $(id).addEventListener('input', () => touched = true));
+['playout', 'snd', 'cap', 'recv'].forEach((id) => $(id).addEventListener('input', () => touched = true));
 
 async function refresh() {
   let s; try { s = await GetStatus(); } catch (e) { msg('backend error: ' + e); return; }
@@ -107,13 +108,15 @@ async function refresh() {
   document.querySelectorAll('#role button').forEach((b) => b.classList.toggle('active', b.dataset.role === (s.roleMode || '')));
   $('rolebadge').textContent = s.role ? ' · ' + s.role : '';
 
-  $('recv').disabled = !isWin; $('snd').disabled = isWin; $('cap').disabled = isWin;
+  // Playout buffer is the listener's lever (client side); Send/Capture are the source's (host side).
+  $('recv').disabled = !isWin; $('playout').disabled = !isWin; $('snd').disabled = isWin; $('cap').disabled = isWin;
   $('snd').closest('.slider').classList.toggle('disabled', isWin);
   $('cap').closest('.slider').classList.toggle('disabled', isWin);
   $('recv').closest('.slider').classList.toggle('disabled', !isWin);
+  $('playout').closest('.slider').classList.toggle('disabled', !isWin);
   $('autostart').checked = !!s.autoStart;
 
-  if (!touched) { $('snd').value = s.sndBufKB; $('cap').value = s.captureMs; $('recv').value = s.recvBufKB; sv(); }
+  if (!touched) { $('playout').value = s.playoutMs; $('snd').value = s.sndBufKB; $('cap').value = s.captureMs; $('recv').value = s.recvBufKB; sv(); }
   if ($('vol') !== document.activeElement) { $('vol').value = s.volumePct; $('vol-v').textContent = s.volumePct + '%'; }
 }
 
@@ -121,12 +124,12 @@ $('power').addEventListener('click', async () => { msg('…'); msg(await Toggle(
 $('ipsave').addEventListener('click', async () => { msg('saving IP…'); msg(await SetPeerIP($('ip').value)); ipFocused = false; setTimeout(refresh, 700); });
 $('ip').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('ipsave').click(); });
 $('scan').addEventListener('click', async () => {
-  msg('scanning Tailscale…');
+  msg('scanning Tailscale + LAN…');
   let peers = [];
   try { peers = await DiscoverPeers(); } catch (e) { msg('scan failed: ' + e); return; }
   const box = $('peers');
   box.innerHTML = '';
-  if (!peers || !peers.length) { box.hidden = true; msg('No hearken hosts found on your Tailscale.'); return; }
+  if (!peers || !peers.length) { box.hidden = true; msg('No hearken hosts found on Tailscale or LAN.'); return; }
   peers.forEach((p) => {
     const b = document.createElement('button');
     b.className = 'peerchip';
@@ -145,7 +148,7 @@ $('scan').addEventListener('click', async () => {
 document.querySelectorAll('#dir button').forEach((b) => b.addEventListener('click', async () => { msg('switching…'); msg(await SetDirection(b.dataset.dir)); setTimeout(refresh, 700); }));
 document.querySelectorAll('#role button').forEach((b) => b.addEventListener('click', async () => { msg('switching mode…'); msg(await SetRole(b.dataset.role)); setTimeout(refresh, 700); }));
 $('verify').addEventListener('click', async () => { msg('verifying…'); msg(await Verify()); });
-$('apply').addEventListener('click', async () => { msg('applying…'); const r = await ApplyParams(parseInt($('snd').value), parseInt($('cap').value), parseInt($('recv').value)); touched = false; msg(r); setTimeout(refresh, 800); });
+$('apply').addEventListener('click', async () => { msg('applying…'); const r = await ApplyParams(parseInt($('snd').value), parseInt($('cap').value), parseInt($('recv').value), parseInt($('playout').value)); touched = false; msg(r); setTimeout(refresh, 800); });
 $('autostart').addEventListener('change', async () => { await SetAutoStart($('autostart').checked); });
 $('vol').addEventListener('input', () => { $('vol-v').textContent = $('vol').value + '%'; });
 $('vol').addEventListener('change', async () => { msg('volume ' + $('vol').value + '%…'); msg(await SetVolume(parseInt($('vol').value))); setTimeout(refresh, 700); });
