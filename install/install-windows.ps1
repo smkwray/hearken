@@ -24,11 +24,26 @@ if (Get-Command wails -ErrorAction SilentlyContinue) {
   Write-Host "  into $repo\build\bin\ (from a GitHub release)."
 }
 
-Write-Host "== 3/3  Tailscale (optional; a plain LAN IP also works) ==" -ForegroundColor Cyan
+Write-Host "== 3/4  Register logon task (headless daemon + tray icon) ==" -ForegroundColor Cyan
+$exe = "$repo\build\bin\hearken.exe"
+if (Test-Path $exe) {
+  $action    = New-ScheduledTaskAction -Execute $exe
+  $trigger   = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+  $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
+  $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Seconds 0)
+  Register-ScheduledTask -TaskName Hearken -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+  Start-ScheduledTask -TaskName Hearken
+  Write-Host "  registered + started 'Hearken' (runs the daemon headless at logon; tray icon)"
+} else {
+  Write-Host "  hearken.exe not found — build it first, then re-run."
+}
+
+Write-Host "== 4/4  Tailscale (optional; a plain LAN IP also works) ==" -ForegroundColor Cyan
 if (-not (Get-Command tailscale -ErrorAction SilentlyContinue)) {
   Write-Host "  Install Tailscale (https://tailscale.com/download) and log in, or use a LAN IP."
 }
 
 Write-Host ""
-Write-Host "Done. Launch hearken.exe, put the HOST's IP in 'Peer IP', Save." -ForegroundColor Green
-Write-Host "Windows defaults to CLIENT (it dials the host). It auto-connects on every launch thereafter."
+Write-Host "Done. A hearken icon is in the system tray." -ForegroundColor Green
+Write-Host "Click it -> Open hearken, put the HOST's IP in 'Peer IP' (or press Scan), Save."
+Write-Host "Windows defaults to CLIENT; it auto-connects on every logon thereafter."
