@@ -2,6 +2,7 @@ package main
 
 import (
 	"embed"
+	"net"
 	"os"
 
 	"github.com/wailsapp/wails/v2"
@@ -28,6 +29,16 @@ func main() {
 }
 
 func runWindow() {
+	// Single config window at a time: hold a lock port for the window's lifetime.
+	// A second "Open" then exits immediately instead of stacking windows/Dock icons.
+	if !bindingsMode {
+		ln, err := net.Listen("tcp", windowLockAddr)
+		if err != nil {
+			return // a window is already open
+		}
+		defer ln.Close()
+	}
+
 	app := NewWindowApp(daemonURL)
 	err := wails.Run(&options.App{
 		Title:            "hearken",
@@ -39,9 +50,10 @@ func runWindow() {
 		MaxHeight:        820,
 		AssetServer:      &assetserver.Options{Assets: assets},
 		BackgroundColour: &options.RGBA{R: 18, G: 20, B: 27, A: 1},
-		OnStartup:        app.startup,
-		OnShutdown:       app.shutdown,
-		Bind:             []interface{}{app},
+		// No Dock icon: hearken is a menubar agent (LSUIElement in the Info.plist).
+		OnStartup:  app.startup,
+		OnShutdown: app.shutdown,
+		Bind:       []interface{}{app},
 	})
 	if err != nil {
 		println("Error:", err.Error())

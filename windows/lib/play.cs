@@ -56,6 +56,29 @@ namespace AudioBridge {
       }
     }
 
+    // LatencyCap wraps the jitter buffer and drops the oldest excess on each read,
+    // so playout latency stays bounded (a network burst / clock drift can otherwise
+    // bloat BufferedWaveProvider to seconds and it never drains back down).
+    class LatencyCap : NAudio.Wave.IWaveProvider {
+      readonly BufferedWaveProvider src;
+      readonly int maxBytes;
+      public LatencyCap(BufferedWaveProvider s, int max) { src = s; maxBytes = max; }
+      public WaveFormat WaveFormat { get { return src.WaveFormat; } }
+      public int Read(byte[] buffer, int offset, int count) {
+        int over = src.BufferedBytes - maxBytes;
+        if (over > 0) {
+          byte[] skip = new byte[Math.Min(over, 65536)];
+          int dropped = 0;
+          while (dropped < over) {
+            int r = src.Read(skip, 0, Math.Min(skip.Length, over - dropped));
+            if (r <= 0) break;
+            dropped += r;
+          }
+        }
+        return src.Read(buffer, offset, count);
+      }
+    }
+
     class OutputChain {
       public MMDevice Device;
       public IDisposable Resampler;
@@ -87,7 +110,7 @@ namespace AudioBridge {
         if (e.Exception != null) Console.Error.WriteLine("stopped: " + e.Exception.Message);
         deviceChanged = true;
       };
-      wo.Init(netBuf);
+      wo.Init(new LatencyCap(netBuf, 48000)); // cap playout latency ~250ms (drop oldest on bloat)
       wo.Play();
       BindAndUnmute(dev);
       Console.Error.WriteLine("playing WASAPI shared, state=" + wo.PlaybackState);

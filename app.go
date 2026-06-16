@@ -40,6 +40,7 @@ const talkPort = 45001
 const blackholeUID = "BlackHole2ch_UID"
 const daemonAddr = "127.0.0.1:47600" // headless daemon's local control API
 const daemonURL = "http://" + daemonAddr
+const windowLockAddr = "127.0.0.1:47601" // single-instance lock for the config window
 
 type Config struct {
 	PeerIP    string `json:"peerIP"`

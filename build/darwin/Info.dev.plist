@@ -25,6 +25,8 @@
         <string>{{.Info.Copyright}}</string>
         <key>NSMicrophoneUsageDescription</key>
         <string>hearken captures this Mac's system audio (via BlackHole) to stream it to a paired device on your network.</string>
+        <key>LSUIElement</key>
+        <true/>
         {{if .Info.FileAssociations}}
         <key>CFBundleDocumentTypes</key>
         <array>
