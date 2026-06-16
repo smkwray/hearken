@@ -1,0 +1,15 @@
+# build output
+build/bin
+node_modules
+frontend/dist
+
+# compiled native helpers (built by install/build scripts; sources are tracked)
+mac/hear-capture
+mac/find-output-index
+mac/make-bridge-out
+mac/setdef
+windows/lib/*.exe
+
+# macOS / editor cruft
+.DS_Store
+*.swp
