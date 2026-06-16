@@ -65,7 +65,10 @@ header { display: flex; align-items: baseline; justify-content: space-between; }
 .slider { display: grid; grid-template-columns: 78px 1fr 56px; align-items: center; gap: 10px; margin: 9px 0; }
 .slider .lbl { color: var(--muted); font-size: 12px; }
 .slider .val { text-align: right; font-variant-numeric: tabular-nums; font-size: 12.5px; }
-.slider.disabled { opacity: .4; }
+.slider .val.elsewhere { font-style: italic; font-size: 11px; white-space: nowrap; }
+.slider.disabled { opacity: .55; }
+/* disabled rows show a "set on <peer>" hint — give it room */
+.slider.disabled { grid-template-columns: 78px 1fr auto; }
 
 input[type=range] { -webkit-appearance: none; appearance: none; height: 4px; border-radius: 3px; background: var(--card2); outline: none; }
 input[type=range]::-webkit-slider-thumb {

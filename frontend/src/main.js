@@ -118,6 +118,14 @@ async function refresh() {
 
   if (!touched) { $('playout').value = s.playoutMs; $('snd').value = s.sndBufKB; $('cap').value = s.captureMs; $('recv').value = s.recvBufKB; sv(); }
   if ($('vol') !== document.activeElement) { $('vol').value = s.volumePct; $('vol-v').textContent = s.volumePct + '%'; }
+
+  // A grayed slider is the OTHER machine's lever — show where to set it instead of a stale value.
+  const peerName = s.peer || 'the peer';
+  ['playout', 'cap', 'snd', 'recv'].forEach((id) => {
+    const v = $(id + '-v');
+    if ($(id).disabled) { v.textContent = 'set on ' + peerName; v.classList.add('elsewhere'); }
+    else v.classList.remove('elsewhere');
+  });
 }
 
 $('power').addEventListener('click', async () => { msg('…'); msg(await Toggle()); setTimeout(refresh, 700); });
