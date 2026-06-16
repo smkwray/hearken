@@ -26,10 +26,13 @@ jobs:
         with: { node-version: '20' }
       - run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
       - run: wails build -platform darwin/universal
-      - name: Zip .app
-        run: ditto -c -k --keepParent build/bin/hearken.app hearken-macos.zip
+      - name: Package .app (zip + drag-to-Applications dmg)
+        run: |
+          ditto -c -k --keepParent build/bin/hearken.app hearken-macos.zip
+          mkdir -p dmg && cp -R build/bin/hearken.app dmg/ && ln -s /Applications dmg/Applications
+          hdiutil create -volname hearken -srcfolder dmg -ov -format UDZO hearken-macos.dmg
       - uses: actions/upload-artifact@v4
-        with: { name: hearken-macos, path: hearken-macos.zip }
+        with: { name: hearken-macos, path: "hearken-macos.*" }
 
   windows:
     runs-on: windows-latest
@@ -64,5 +67,7 @@ jobs:
         with: { path: artifacts }
       - uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/**/*.zip
+          files: |
+            artifacts/**/*.zip
+            artifacts/**/*.dmg
           generate_release_notes: true
