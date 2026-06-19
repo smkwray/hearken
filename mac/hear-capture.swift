@@ -14,6 +14,30 @@ signal(SIGPIPE, SIG_IGN)   // writing to a closed client must not kill us
 
 var clientFD: Int32 = -1
 
+// --- silence suppression (squelch) ---------------------------------------
+// Don't ship a constant ~1.5 Mbps of digital silence. Stop sending once the
+// captured audio has been silent for `squelchHold`; resume instantly on the
+// first real sample. While suppressed, trickle one buffer every
+// `squelchKeepalive` s to keep the TCP/Tailscale path warm and the receiver
+// primed (~a few kbps vs 1.5 Mbps). BRIDGE_SQUELCH=0 disables (old behavior).
+let squelchThreshold = Int16(ProcessInfo.processInfo.environment["BRIDGE_SQUELCH"] ?? "16") ?? 16  // peak |s16| (~-66 dBFS)
+let squelchHold = 0.25        // s of continuous silence before we stop sending (tail)
+let squelchKeepalive = 2.0    // max gap between transmitted buffers while silent
+var lastSoundTime = CFAbsoluteTimeGetCurrent()
+var lastSentTime = 0.0
+
+// bufferIsSilent: is every s16le sample at/below the squelch threshold? thr<=0 disables.
+func bufferIsSilent(_ p: UnsafeRawPointer, _ len: Int, _ thr: Int16) -> Bool {
+    if thr <= 0 { return false }
+    let n = len / 2
+    let s = p.bindMemory(to: Int16.self, capacity: n)
+    for i in 0..<n {
+        let v = Int(s[i])
+        if (v < 0 ? -v : v) > Int(thr) { return false }
+    }
+    return true
+}
+
 @discardableResult
 func writeAll(_ fd: Int32, _ p: UnsafeRawPointer, _ len: Int) -> Bool {
     var off = 0
@@ -30,9 +54,17 @@ let cb: AudioQueueInputCallback = { _, queue, bufRef, _, _, _ in
     let b = bufRef.pointee
     let len = Int(b.mAudioDataByteSize)
     if clientFD >= 0, len > 0 {
-        if !writeAll(clientFD, b.mAudioData, len) {
-            close(clientFD); clientFD = -1
-            CFRunLoopStop(CFRunLoopGetCurrent())
+        let now = CFAbsoluteTimeGetCurrent()
+        let silent = bufferIsSilent(b.mAudioData, len, squelchThreshold)
+        if !silent { lastSoundTime = now }
+        let inHold = (now - lastSoundTime) < squelchHold
+        let keepalive = (now - lastSentTime) >= squelchKeepalive
+        if !silent || inHold || keepalive {       // squelch: skip pure-silence buffers
+            lastSentTime = now
+            if !writeAll(clientFD, b.mAudioData, len) {
+                close(clientFD); clientFD = -1
+                CFRunLoopStop(CFRunLoopGetCurrent())
+            }
         }
     }
     AudioQueueEnqueueBuffer(queue, bufRef, 0, nil)
@@ -70,7 +102,8 @@ while true {
     var sndbuf = Int32(ProcessInfo.processInfo.environment["BRIDGE_SNDBUF"] ?? "16384") ?? 16384
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, socklen_t(MemoryLayout<Int32>.size))
     clientFD = fd
-    FileHandle.standardError.write("client connected; capturing \(DEVUID)\n".data(using: .utf8)!)
+    lastSoundTime = CFAbsoluteTimeGetCurrent()   // fresh hold window so the new client gets audio at once
+    FileHandle.standardError.write("client connected; capturing \(DEVUID); squelch=\(squelchThreshold) (0=off)\n".data(using: .utf8)!)
 
     var queue: AudioQueueRef?
     var st = AudioQueueNewInput(&fmt, cb, nil, CFRunLoopGetCurrent(), CFRunLoopMode.commonModes.rawValue, 0, &queue)

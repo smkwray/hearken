@@ -37,6 +37,18 @@ namespace AudioBridge {
       }
     }
 
+    // IsSilent reports whether an s16le block is at/below the squelch threshold
+    // (peak |sample|). thr<=0 disables (treat everything as "has sound").
+    static bool IsSilent(byte[] b, int n, int thr) {
+      if (thr <= 0) return false;
+      for (int i = 0; i + 1 < n; i += 2) {
+        short s = (short)(b[i] | (b[i + 1] << 8));
+        int a = s < 0 ? -s : s;
+        if (a > thr) return false;
+      }
+      return true;
+    }
+
     static void RunCapture(Stream outStream, WaveFormat outFmt) {
       var cap = new WasapiLoopbackCapture();
       var srcFmt = WaveFormat.CreateIeeeFloatWaveFormat(cap.WaveFormat.SampleRate, cap.WaveFormat.Channels);
@@ -55,16 +67,35 @@ namespace AudioBridge {
         int interval = 20;
         int chunk = bps * interval / 1000; chunk -= chunk % (outFmt.Channels * 2);
         byte[] tmp = new byte[chunk];
+        // Silence suppression (squelch): don't ship a constant 1.5 Mbps of digital
+        // silence. Stop transmitting once the audio has been silent for `hold`;
+        // resume instantly on the first real sample. While suppressed, trickle one
+        // chunk every `keepaliveMs` to keep the TCP/NAT path warm and the receiver
+        // primed (~a few kbps vs 1.5 Mbps). BRIDGE_SQUELCH=0 disables (old behavior).
+        int squelch = 16, sqEnv; // peak |s16| threshold (~-66 dBFS); env override below
+        if (int.TryParse(Environment.GetEnvironmentVariable("BRIDGE_SQUELCH"), out sqEnv)) squelch = sqEnv;
+        const long holdMs = 250;      // keep sending this long after the last sound (tail)
+        const long keepaliveMs = 2000; // max gap between transmitted chunks while silent
+        Console.Error.WriteLine("squelch threshold=" + squelch + " (0=off), hold=" + holdMs + "ms");
         var sw = Stopwatch.StartNew();
         long written = 0;
+        long lastSoundMs = 0, lastSentMs = 0;
         try {
           while (!stop.IsSet) {
             long target = (long)(sw.Elapsed.TotalSeconds * bps);
             while (written < target) {
               int n = resampler.Read(tmp, 0, tmp.Length);
               if (n <= 0) break;
-              outStream.Write(tmp, 0, n);
-              written += n;
+              written += n; // advance the clock regardless of whether we transmit
+              long nowMs = sw.ElapsedMilliseconds;
+              bool silent = IsSilent(tmp, n, squelch);
+              if (!silent) lastSoundMs = nowMs;
+              bool inHold = (nowMs - lastSoundMs) < holdMs;
+              bool keepalive = (nowMs - lastSentMs) >= keepaliveMs;
+              if (!silent || inHold || keepalive) {
+                outStream.Write(tmp, 0, n);
+                lastSentMs = nowMs;
+              }
             }
             outStream.Flush();
             Thread.Sleep(interval);
