@@ -27,6 +27,14 @@ namespace AudioBridge {
           using (var client = new TcpClient()) {
             client.Connect(host, port);
             client.NoDelay = true;
+            // Bound writes to a dead / half-open peer (Windows sleep/wake) so this
+            // loop reconnects instead of blocking. Disposing the stale TcpClient on
+            // failure also sends a FIN to the Mac, which lets its ffmpeg listener stop
+            // reading the dead socket and accept our fresh connection. Keepalive is the
+            // backstop for the silent path, where writes are too sparse to fill the
+            // send buffer and trip SendTimeout on their own.
+            client.SendTimeout = 5000;
+            EnableKeepAlive(client.Client, 10000, 1000);
             Console.Error.WriteLine("connected");
             RunCapture(client.GetStream(), outFmt);
           }
@@ -35,6 +43,18 @@ namespace AudioBridge {
         }
         Thread.Sleep(1000);
       }
+    }
+
+    // EnableKeepAlive turns on TCP keepalive with a short idle/interval (ms) so the
+    // OS tears down a half-open connection in seconds, not the 2-hour Windows default.
+    static void EnableKeepAlive(Socket sock, uint idleMs, uint intervalMs) {
+      try {
+        byte[] cfg = new byte[12];
+        BitConverter.GetBytes((uint)1).CopyTo(cfg, 0);    // keepalive on
+        BitConverter.GetBytes(idleMs).CopyTo(cfg, 4);     // idle before first probe
+        BitConverter.GetBytes(intervalMs).CopyTo(cfg, 8); // gap between probes
+        sock.IOControl(IOControlCode.KeepAliveValues, cfg, null);
+      } catch {}
     }
 
     // IsSilent reports whether an s16le block is at/below the squelch threshold

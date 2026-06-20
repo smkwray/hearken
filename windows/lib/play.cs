@@ -49,6 +49,19 @@ namespace AudioBridge {
           using (var client = new TcpClient()) {
             client.Connect(host, port);
             client.NoDelay = true;
+            // Detect a dead / half-open link so the reconnect loop below actually
+            // fires. Two failure modes this guards against:
+            //   1. Windows sleeps and wakes -> the TCP connection is half-open; the
+            //      OS still reports it ESTABLISHED but no bytes ever arrive.
+            //   2. We connected into the host's listen backlog but it never accept()ed
+            //      us (it was still streaming to a stale prior client).
+            // In both cases net.Read() would otherwise block FOREVER, so the process
+            // stays alive, netstat shows ESTABLISHED, and the UI shows a phantom
+            // "Streaming" with no audio. The Mac host streams audio continuously, or
+            // a squelch keepalive every ~2s while silent, so 5s of total silence on a
+            // live link is impossible -> a 5s read timeout means the link is gone.
+            client.ReceiveTimeout = 5000;
+            EnableKeepAlive(client.Client, 10000, 1000); // OS-level net, second line of defense
             Console.Error.WriteLine("connected");
             RunPlay(client.GetStream());
           }
@@ -57,6 +70,18 @@ namespace AudioBridge {
         }
         Thread.Sleep(1000);
       }
+    }
+
+    // EnableKeepAlive turns on TCP keepalive with a short idle/interval (ms) so the
+    // OS tears down a half-open connection in seconds, not the 2-hour Windows default.
+    static void EnableKeepAlive(Socket sock, uint idleMs, uint intervalMs) {
+      try {
+        byte[] cfg = new byte[12];
+        BitConverter.GetBytes((uint)1).CopyTo(cfg, 0);    // keepalive on
+        BitConverter.GetBytes(idleMs).CopyTo(cfg, 4);     // idle before first probe
+        BitConverter.GetBytes(intervalMs).CopyTo(cfg, 8); // gap between probes
+        sock.IOControl(IOControlCode.KeepAliveValues, cfg, null);
+      } catch {}
     }
 
     // LatencyCap wraps the jitter buffer and drops the oldest excess on each read,

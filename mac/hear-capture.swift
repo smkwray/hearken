@@ -101,6 +101,20 @@ while true {
     // Small buffer = tight coupling to the receiver = low latency. Tunable via env.
     var sndbuf = Int32(ProcessInfo.processInfo.environment["BRIDGE_SNDBUF"] ?? "16384") ?? 16384
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, socklen_t(MemoryLayout<Int32>.size))
+    // Drop a client that vanished without a clean FIN (peer slept / lost power / crashed)
+    // so we re-accept instead of streaming forever into a dead socket. TCP keepalive
+    // probes the peer; SO_SNDTIMEO makes a stalled write() fail fast (the small SO_SNDBUF
+    // fills in ~0.1s against a dead peer) -> writeAll returns false -> we close + re-accept.
+    var ka: Int32 = 1
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &ka, socklen_t(MemoryLayout<Int32>.size))
+    var kaIdle: Int32 = 10  // seconds idle before first probe
+    setsockopt(fd, Int32(IPPROTO_TCP), TCP_KEEPALIVE, &kaIdle, socklen_t(MemoryLayout<Int32>.size))
+    var kaIntvl: Int32 = 2  // seconds between probes
+    setsockopt(fd, Int32(IPPROTO_TCP), TCP_KEEPINTVL, &kaIntvl, socklen_t(MemoryLayout<Int32>.size))
+    var kaCnt: Int32 = 4    // probes before giving up
+    setsockopt(fd, Int32(IPPROTO_TCP), TCP_KEEPCNT, &kaCnt, socklen_t(MemoryLayout<Int32>.size))
+    var sndTimeout = timeval(tv_sec: 5, tv_usec: 0)
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &sndTimeout, socklen_t(MemoryLayout<timeval>.size))
     clientFD = fd
     lastSoundTime = CFAbsoluteTimeGetCurrent()   // fresh hold window so the new client gets audio at once
     FileHandle.standardError.write("client connected; capturing \(DEVUID); squelch=\(squelchThreshold) (0=off)\n".data(using: .utf8)!)
