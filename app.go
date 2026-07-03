@@ -261,11 +261,25 @@ func run(timeout time.Duration, name string, args ...string) (string, error) {
 	return string(out), err
 }
 
+const maxLogBytes = 10 << 20 // rotate hearken.log at 10MB (one .old kept)
+
+// rotateLog caps the log by renaming it to hearken.log.old once it exceeds
+// maxLogBytes. Called at open time only, so a long-lived child writing to an
+// already-open handle can overshoot until it next respawns.
+func rotateLog(path string) {
+	if fi, err := os.Stat(path); err == nil && fi.Size() > maxLogBytes {
+		os.Remove(path + ".old")
+		os.Rename(path, path+".old")
+	}
+}
+
 func logf(format string, args ...any) {
 	d, _ := os.UserConfigDir()
 	dir := filepath.Join(d, "hearken")
 	os.MkdirAll(dir, 0o755)
-	f, err := os.OpenFile(filepath.Join(dir, "hearken.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	p := filepath.Join(dir, "hearken.log")
+	rotateLog(p)
+	f, err := os.OpenFile(p, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return
 	}
@@ -676,7 +690,9 @@ func (a *App) supervise(ctx context.Context, r role, cfg Config) {
 		hideWindow(cmd) // no console-window flash on Windows
 		logf("supervise role=%d exec=%s args=%v", r, cmd.Path, cmd.Args[1:])
 		d, _ := os.UserConfigDir()
-		if lf, e := os.OpenFile(filepath.Join(d, "hearken", "hearken.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); e == nil {
+		lp := filepath.Join(d, "hearken", "hearken.log")
+		rotateLog(lp)
+		if lf, e := os.OpenFile(lp, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); e == nil {
 			cmd.Stdout, cmd.Stderr = lf, lf
 			err := cmd.Run()
 			lf.Close()
@@ -719,7 +735,12 @@ func (a *App) buildCmd(ctx context.Context, r role, cfg Config) *exec.Cmd {
 
 	case roleHostPlayServe: // listen on talkPort, play received audio
 		if mac {
-			return ffmpegPlay(ctx, fmt.Sprintf("tcp://0.0.0.0:%d?listen=1", talkPort), a.realOutputIndex(), gainArg(cfg))
+			// timeout (µs): the sender keepalives every ≤2s even while squelched, so 8s
+			// with no bytes = half-open link (peer slept/vanished). ffmpeg exits, the
+			// supervisor relaunches it, and it listens again. Without this, one stale
+			// client wedges the single-accept listener forever and every redial from
+			// the peer is refused.
+			return ffmpegPlay(ctx, fmt.Sprintf("tcp://0.0.0.0:%d?listen=1&timeout=8000000", talkPort), a.realOutputIndex(), gainArg(cfg))
 		}
 		// TODO(win-host): play.exe needs a server mode:
 		//   play.exe --listen <port>  (accept TCP -> WASAPI render to current default device)
@@ -733,7 +754,8 @@ func (a *App) buildCmd(ctx context.Context, r role, cfg Config) *exec.Cmd {
 			return exec.CommandContext(ctx, playExe(), cfg.PeerIP, strconv.Itoa(hearPort), gainArg(cfg), playoutArg(cfg))
 		}
 		// Mac client: ffmpeg dials the host and plays to the real output device.
-		return ffmpegPlay(ctx, fmt.Sprintf("tcp://%s:%d", cfg.PeerIP, hearPort), a.realOutputIndex(), gainArg(cfg))
+		// Same 8s read timeout as the listen path to shake off a half-open link.
+		return ffmpegPlay(ctx, fmt.Sprintf("tcp://%s:%d?timeout=8000000", cfg.PeerIP, hearPort), a.realOutputIndex(), gainArg(cfg))
 
 	case roleClientCapDial: // dial talkPort, send my captured audio
 		if !mac {
@@ -789,7 +811,7 @@ func (a *App) disableLegacyServices() {
 		run(5*time.Second, "launchctl", "bootout", "gui/"+uid+"/com.shane.audiobridge.talk")
 		// sweep orphaned bridge children from a previously crashed/killed daemon
 		run(3*time.Second, "pkill", "-f", "hear-capture "+strconv.Itoa(hearPort))
-		run(3*time.Second, "pkill", "-f", fmt.Sprintf("tcp://0.0.0.0:%d?listen=1", talkPort))
+		run(3*time.Second, "pkill", "-f", fmt.Sprintf("tcp://0.0.0.0:%d", talkPort)) // note: arg is a regex; keep it metachar-free
 	} else {
 		run(8*time.Second, "schtasks", "/End", "/TN", "HearMac")
 		run(8*time.Second, "schtasks", "/Change", "/TN", "HearMac", "/DISABLE")
