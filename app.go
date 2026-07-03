@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"debug/macho"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -197,22 +198,57 @@ func home() string { h, _ := os.UserHomeDir(); return h }
 func abDir() string { return filepath.Join(home(), "audio-bridge") }
 func exists(p string) bool { _, err := os.Stat(p); return err == nil }
 
-func ffmpegPath() string {
-	if runtime.GOOS == "darwin" {
-		if p := filepath.Join(home(), "bin", "ffmpeg"); exists(p) {
+// nativeExec reports whether the Mach-O at path can run natively on this host —
+// i.e. it has a slice for the current CPU arch. A thin x86_64 binary on Apple
+// silicon returns false: launching it would invoke Rosetta, which makes macOS
+// flag hearken as an "Intel-based app" (the support-ending notification). Only
+// meaningful on macOS; elsewhere we don't gate on arch. Unreadable/non-Mach-O -> false.
+func nativeExec(path string) bool {
+	if runtime.GOOS != "darwin" {
+		return true
+	}
+	want := macho.CpuAmd64
+	if runtime.GOARCH == "arm64" {
+		want = macho.CpuArm64
+	}
+	if fat, err := macho.OpenFat(path); err == nil { // universal binary
+		defer fat.Close()
+		for _, a := range fat.Arches {
+			if a.Cpu == want {
+				return true
+			}
+		}
+		return false
+	}
+	f, err := macho.Open(path) // thin binary
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	return f.Cpu == want
+}
+
+// macTool resolves a macOS CLI helper (ffmpeg/ffplay), preferring an
+// arch-native build so we never spawn an Intel binary under Rosetta. We skip a
+// candidate that exists but isn't native; the bare name (PATH lookup) is the
+// final fallback.
+func macTool(name string) string {
+	if runtime.GOOS != "darwin" {
+		return name
+	}
+	for _, p := range []string{
+		filepath.Join(home(), "bin", name), // user-provided
+		"/opt/homebrew/bin/" + name,        // Homebrew (Apple silicon)
+		"/usr/local/bin/" + name,           // Homebrew (Intel prefix) / manual
+	} {
+		if exists(p) && nativeExec(p) {
 			return p
 		}
 	}
-	return "ffmpeg"
+	return name
 }
-func ffplayPath() string {
-	if runtime.GOOS == "darwin" {
-		if p := filepath.Join(home(), "bin", "ffplay"); exists(p) {
-			return p
-		}
-	}
-	return "ffplay"
-}
+func ffmpegPath() string { return macTool("ffmpeg") }
+func ffplayPath() string { return macTool("ffplay") }
 func captureExe() string { return filepath.Join(abDir(), "lib", "capture.exe") }
 func playExe() string    { return filepath.Join(abDir(), "lib", "play.exe") }
 
