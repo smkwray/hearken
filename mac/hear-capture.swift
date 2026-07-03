@@ -49,7 +49,54 @@ func writeAll(_ fd: Int32, _ p: UnsafeRawPointer, _ len: Int) -> Bool {
     return true
 }
 
-// AudioQueue input callback: ship the captured bytes to the client, recycle buffer.
+// --- decoupled sender ------------------------------------------------------
+// The AudioQueue callback must NEVER block: a blocking write() during a network
+// hiccup stalls the callback, the (few) capture buffers overrun, and samples are
+// lost at the source — audible crackle no receiver-side buffer can hide. So the
+// callback only appends to this queue; a dedicated thread does the blocking I/O.
+// On overflow (sustained stall) we drop the OLDEST audio, frame-aligned, so the
+// stream stays fresh rather than building latency.
+let sendCond = NSCondition()
+var sendPending = Data()
+var senderDead = false
+let sendPendingMax = 96 * 1024      // ~0.5s ceiling during a stall, then drop-oldest
+let mainLoop = CFRunLoopGetCurrent()
+
+func enqueueSend(_ p: UnsafeRawPointer, _ len: Int) {
+    sendCond.lock()
+    if !senderDead {
+        let over = sendPending.count + len - sendPendingMax
+        if over > 0 {
+            sendPending.removeFirst((over + 3) / 4 * 4)  // frame-aligned drop-oldest
+        }
+        sendPending.append(UnsafeRawBufferPointer(start: p, count: len).bindMemory(to: UInt8.self))
+        sendCond.signal()
+    }
+    sendCond.unlock()
+}
+
+// startSender drains the queue to fd on its own thread; on write failure it marks
+// the link dead and stops the main run loop so we tear down and re-accept.
+func startSender(_ fd: Int32) {
+    Thread.detachNewThread {
+        while true {
+            sendCond.lock()
+            while sendPending.isEmpty && !senderDead { sendCond.wait() }
+            if senderDead { sendCond.unlock(); return }
+            let chunk = sendPending
+            sendPending.removeAll(keepingCapacity: true)
+            sendCond.unlock()
+            let ok = chunk.withUnsafeBytes { writeAll(fd, $0.baseAddress!, chunk.count) }
+            if !ok {
+                sendCond.lock(); senderDead = true; sendCond.unlock()
+                CFRunLoopStop(mainLoop)
+                return
+            }
+        }
+    }
+}
+
+// AudioQueue input callback: hand the captured bytes to the sender thread, recycle buffer.
 let cb: AudioQueueInputCallback = { _, queue, bufRef, _, _, _ in
     let b = bufRef.pointee
     let len = Int(b.mAudioDataByteSize)
@@ -61,10 +108,7 @@ let cb: AudioQueueInputCallback = { _, queue, bufRef, _, _, _ in
         let keepalive = (now - lastSentTime) >= squelchKeepalive
         if !silent || inHold || keepalive {       // squelch: skip pure-silence buffers
             lastSentTime = now
-            if !writeAll(clientFD, b.mAudioData, len) {
-                close(clientFD); clientFD = -1
-                CFRunLoopStop(CFRunLoopGetCurrent())
-            }
+            enqueueSend(b.mAudioData, len)
         }
     }
     AudioQueueEnqueueBuffer(queue, bufRef, 0, nil)
@@ -116,12 +160,21 @@ while true {
     var sndTimeout = timeval(tv_sec: 5, tv_usec: 0)
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &sndTimeout, socklen_t(MemoryLayout<timeval>.size))
     clientFD = fd
+    sendCond.lock()
+    sendPending.removeAll()
+    senderDead = false
+    sendCond.unlock()
+    startSender(fd)
     lastSoundTime = CFAbsoluteTimeGetCurrent()   // fresh hold window so the new client gets audio at once
     FileHandle.standardError.write("client connected; capturing \(DEVUID); squelch=\(squelchThreshold) (0=off)\n".data(using: .utf8)!)
 
     var queue: AudioQueueRef?
     var st = AudioQueueNewInput(&fmt, cb, nil, CFRunLoopGetCurrent(), CFRunLoopMode.commonModes.rawValue, 0, &queue)
-    if st != noErr || queue == nil { FileHandle.standardError.write("AudioQueueNewInput \(st)\n".data(using: .utf8)!); close(fd); clientFD = -1; continue }
+    if st != noErr || queue == nil {
+        FileHandle.standardError.write("AudioQueueNewInput \(st)\n".data(using: .utf8)!)
+        sendCond.lock(); senderDead = true; sendCond.signal(); sendCond.unlock()
+        close(fd); clientFD = -1; continue
+    }
     var uid = DEVUID
     st = AudioQueueSetProperty(queue!, kAudioQueueProperty_CurrentDevice, &uid, UInt32(MemoryLayout<CFString>.size))
     if st != noErr { FileHandle.standardError.write("set device \(st)\n".data(using: .utf8)!) }
@@ -133,9 +186,10 @@ while true {
         if let buf = buf { AudioQueueEnqueueBuffer(queue!, buf, 0, nil) }
     }
     AudioQueueStart(queue!, nil)
-    CFRunLoopRun()                       // runs until callback stops it (client gone)
+    CFRunLoopRun()                       // runs until the sender stops it (client gone)
     AudioQueueStop(queue!, true)
     AudioQueueDispose(queue!, true)
+    sendCond.lock(); senderDead = true; sendCond.signal(); sendCond.unlock()  // stop sender thread
     if clientFD >= 0 { close(clientFD); clientFD = -1 }
     FileHandle.standardError.write("client gone; ready\n".data(using: .utf8)!)
 }

@@ -84,24 +84,55 @@ namespace AudioBridge {
       } catch {}
     }
 
-    // LatencyCap wraps the jitter buffer and drops the oldest excess on each read,
-    // so playout latency stays bounded (a network burst / clock drift can otherwise
-    // bloat BufferedWaveProvider to seconds and it never drains back down).
+    // LatencyCap wraps the jitter buffer and keeps playout latency bounded, without
+    // the two crackle sources of a naive cap:
+    //   - trims only on SUSTAINED overshoot (several consecutive over-cap reads), so a
+    //     momentary network burst doesn't cause an audible chop every time; when it does
+    //     trim, it trims once down to 3/4 cap, frame-aligned (dropping a non-multiple of
+    //     4 bytes would byte-shift every following sample into loud static).
+    //   - after an underrun (buffer drained, e.g. sender squelched during silence) it
+    //     re-prebuffers: emits silence until the jitter buffer refills, instead of
+    //     playing each packet the instant it arrives with zero jitter headroom.
     class LatencyCap : NAudio.Wave.IWaveProvider {
       readonly BufferedWaveProvider src;
       readonly int maxBytes;
-      public LatencyCap(BufferedWaveProvider s, int max) { src = s; maxBytes = max; }
+      readonly int rebuildBytes;   // refill target after an underrun
+      const int FrameBytes = 4;    // s16le stereo
+      int overReads;               // consecutive reads seen over cap
+      bool starved;
+      public LatencyCap(BufferedWaveProvider s, int max, int rebuild) {
+        src = s; maxBytes = max; rebuildBytes = rebuild;
+      }
       public WaveFormat WaveFormat { get { return src.WaveFormat; } }
       public int Read(byte[] buffer, int offset, int count) {
-        int over = src.BufferedBytes - maxBytes;
-        if (over > 0) {
-          byte[] skip = new byte[Math.Min(over, 65536)];
-          int dropped = 0;
-          while (dropped < over) {
-            int r = src.Read(skip, 0, Math.Min(skip.Length, over - dropped));
-            if (r <= 0) break;
-            dropped += r;
+        int buffered = src.BufferedBytes;
+        if (starved) {
+          if (buffered < rebuildBytes) {           // still refilling: play silence
+            Array.Clear(buffer, offset, count);
+            return count;
           }
+          starved = false;
+        } else if (buffered < count) {             // underrun: hold + refill
+          starved = true;
+          Array.Clear(buffer, offset, count);
+          return count;
+        }
+        // Deadband of ~25ms over cap, and require sustained overshoot before trimming.
+        if (buffered > maxBytes + 25 * BytesPerMs) {
+          if (++overReads >= 4) {
+            int drop = (buffered - maxBytes * 3 / 4) / FrameBytes * FrameBytes;
+            byte[] skip = new byte[Math.Min(drop, 65536)];
+            int dropped = 0;
+            while (dropped < drop) {
+              int r = src.Read(skip, 0, Math.Min(skip.Length, drop - dropped));
+              if (r <= 0) break;
+              dropped += r;
+            }
+            Console.Error.WriteLine("latency trim: dropped " + dropped + "B");
+            overReads = 0;
+          }
+        } else {
+          overReads = 0;
         }
         return src.Read(buffer, offset, count);
       }
@@ -133,12 +164,15 @@ namespace AudioBridge {
       // (DMO) resampler convert to the device mix format. An EXPLICIT
       // MediaFoundationResampler->mix metered a peak but rendered INAUDIBLE to the
       // BT endpoint; the implicit WasapiOut path is what a known-audible local tone used.
-      var wo = new WasapiOut(dev, AudioClientShareMode.Shared, false, 150);
+      // 100ms shared-mode buffer: fixed latency on top of the playout buffer. Event-
+      // driven shared mode is stable well below this; 150 was headroom we don't need.
+      var wo = new WasapiOut(dev, AudioClientShareMode.Shared, false, 100);
       wo.PlaybackStopped += delegate(object s, StoppedEventArgs e) {
         if (e.Exception != null) Console.Error.WriteLine("stopped: " + e.Exception.Message);
         deviceChanged = true;
       };
-      wo.Init(new LatencyCap(netBuf, gPlayoutMs * BytesPerMs)); // cap playout latency (drop oldest on bloat)
+      // cap playout latency (trim on sustained bloat); refill to 60% of cap after underrun
+      wo.Init(new LatencyCap(netBuf, gPlayoutMs * BytesPerMs, gPlayoutMs * BytesPerMs * 3 / 5));
       wo.Play();
       BindAndUnmute(dev);
       Console.Error.WriteLine("playing WASAPI shared, state=" + wo.PlaybackState);
