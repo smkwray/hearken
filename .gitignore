@@ -2,6 +2,14 @@
 build/bin
 node_modules
 frontend/dist
+/hearken
+
+# private/local workflow state
+do/
+.env
+.env.*
+.worktrees/
+*.log
 
 # compiled native helpers (built by install/build scripts; sources are tracked)
 mac/hear-capture
