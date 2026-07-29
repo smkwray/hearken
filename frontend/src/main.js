@@ -12,6 +12,7 @@ app.innerHTML = `
     <div class="selfip" id="selfip"></div>
 
     <div class="deps" id="deps" hidden></div>
+    <div class="deps" id="reach" hidden></div>
 
     <div class="seg" id="role" title="Host listens for the peer; Client dials the host. Auto = host on macOS, client elsewhere.">
       <button data-role="">Auto</button>
@@ -22,7 +23,7 @@ app.innerHTML = `
     <div class="iprow">
       <span class="lbl">Peer IP</span>
       <input id="ip" type="text" inputmode="decimal" placeholder="100.x.y.z (the other machine)" autocomplete="off" spellcheck="false"/>
-      <button class="btn sm" id="scan" title="Find hearken hosts on your Tailscale">Scan</button>
+      <button class="btn sm" id="scan" title="Find hearken hosts on your Tailscale or LAN. Only listening hosts appear; a client dials out and is never discoverable.">Scan</button>
       <button class="btn sm" id="ipsave">Save</button>
     </div>
     <div class="peers" id="peers" hidden></div>
@@ -97,6 +98,26 @@ async function refresh() {
   $('power').classList.toggle('on', s.active);
   $('powtxt').textContent = s.active ? 'Streaming — click to stop' : 'Start';
 
+  // Reachability. The host is the side that listens, so a stopped host means the
+  // peer gets connection-refused with nothing on either screen explaining it.
+  const peerLabel = s.peer || 'the peer';
+  let reach = '', reachInfo = false;
+  if (s.role === 'host' && !s.active) {
+    reach = `⚠ Not listening. ${peerLabel} cannot connect until you press Start`
+      + (s.autoStart ? '.' : ', and “Start bridge automatically on launch” is off.');
+  } else if (s.role === 'host' && !s.peerConnected) {
+    const at = s.selfTailscaleIP || s.selfLANIP;
+    reach = `Listening on ${at ? at + ':45000' : 'port 45000'}. Waiting for ${peerLabel} to dial in.`;
+    reachInfo = true;
+  } else if (s.role === 'client' && !s.peerConnected && s.peerIP) {
+    reach = s.pingMs >= 0
+      ? `⚠ ${s.peerIP} is reachable but nothing is listening on 45000. Press Start on the host.`
+      : `⚠ Cannot reach ${s.peerIP}. Check the address, Tailscale, and the host's firewall.`;
+  }
+  $('reach').hidden = !reach;
+  $('reach').textContent = reach;
+  $('reach').classList.toggle('info', reachInfo);
+
   setPill($('p-bh'), s.blackHole, isWin);
   setPill($('p-bo'), s.bridgeOut, isWin);
   setPill($('p-hear'), s.hearUp);
@@ -137,7 +158,7 @@ $('scan').addEventListener('click', async () => {
   try { peers = await DiscoverPeers(); } catch (e) { msg('scan failed: ' + e); return; }
   const box = $('peers');
   box.innerHTML = '';
-  if (!peers || !peers.length) { box.hidden = true; msg('No hearken hosts found on Tailscale or LAN.'); return; }
+  if (!peers || !peers.length) { box.hidden = true; msg('No hearken hosts found. Scan only lists machines that are listening — a client dials out and never appears here.'); return; }
   peers.forEach((p) => {
     const b = document.createElement('button');
     b.className = 'peerchip';

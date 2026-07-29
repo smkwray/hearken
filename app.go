@@ -421,8 +421,35 @@ func (a *App) GetStatus() Status {
 
 // ---- self IP + peer discovery -------------------------------------------
 
+// routedIP returns the IPv4 this machine sources traffic from when reaching off
+// the box, i.e. the address on the default-route interface. Connecting a UDP
+// socket only fixes the local endpoint; no packets are sent. Returns nil when
+// there is no route, or when the default route belongs to Tailscale (exit node)
+// rather than to a LAN interface.
+func routedIP() net.IP {
+	c, err := net.Dial("udp4", "1.1.1.1:80")
+	if err != nil {
+		return nil
+	}
+	defer c.Close()
+	ua, ok := c.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		return nil
+	}
+	ip4 := ua.IP.To4()
+	if ip4 == nil || !ip4.IsPrivate() {
+		return nil
+	}
+	return ip4
+}
+
 // selfIPs returns this device's Tailscale (100.64/10 CGNAT) and LAN (RFC1918) IPv4s.
 func selfIPs() (tsIP, lanIP string) {
+	// A Mac running internet sharing or holding a Thunderbolt/iPhone bridge up
+	// carries several RFC1918 addresses, and InterfaceAddrs has no useful order:
+	// bridge0's 192.168.2.1 routinely sorts ahead of en0. Handing that one to the
+	// peer fails with no error on either side, so prefer the routed address.
+	routed := routedIP()
 	addrs, _ := net.InterfaceAddrs()
 	for _, a := range addrs {
 		var ip net.IP
@@ -440,11 +467,12 @@ func selfIPs() (tsIP, lanIP string) {
 			if tsIP == "" {
 				tsIP = ip4.String()
 			}
-		} else if ip4.IsPrivate() {
-			if lanIP == "" {
-				lanIP = ip4.String()
-			}
+		} else if ip4.IsPrivate() && lanIP == "" {
+			lanIP = ip4.String() // fallback only; the routed address wins below
 		}
+	}
+	if routed != nil {
+		lanIP = routed.String()
 	}
 	return
 }
@@ -559,6 +587,11 @@ func (a *App) DiscoverPeers() []PeerInfo {
 // lanCandidates returns every host IP on this machine's private /24-or-smaller
 // subnets (for hearken discovery without Tailscale).
 func lanCandidates() []string {
+	// Scan only the subnet this machine actually routes through when one is
+	// determinable. Sweeping every RFC1918 address on the box doubles the probe
+	// count on any Mac with a bridge interface up and spends the extra half on a
+	// subnet that by construction has no peers on it.
+	routed := routedIP()
 	var out []string
 	addrs, _ := net.InterfaceAddrs()
 	for _, a := range addrs {
@@ -568,6 +601,9 @@ func lanCandidates() []string {
 		}
 		ip4 := ipnet.IP.To4()
 		if ip4 == nil || !ip4.IsPrivate() {
+			continue
+		}
+		if routed != nil && !ip4.Equal(routed) {
 			continue
 		}
 		ones, bits := ipnet.Mask.Size()

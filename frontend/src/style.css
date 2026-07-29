@@ -86,6 +86,7 @@ input[type=range]:disabled::-webkit-slider-thumb { background: var(--na); cursor
 
 /* deps banner */
 .deps { background: #3a2417; border: 1px solid #6b3f22; color: #ffc96b; border-radius: 9px; padding: 9px 11px; font-size: 12px; line-height: 1.35; }
+.deps.info { background: #16242f; border-color: #24455c; color: #9fd0ee; }
 
 /* this device's own address */
 .selfip { color: var(--muted); font-size: 11.5px; font-variant-numeric: tabular-nums; min-height: 14px; }
