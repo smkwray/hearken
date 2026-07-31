@@ -146,6 +146,11 @@ namespace AudioBridge {
         try { if (Out != null) Out.Stop(); } catch {}
         try { if (Out != null) Out.Dispose(); } catch {}
         try { if (Resampler != null) Resampler.Dispose(); } catch {}
+        // MMDevice.Dispose() (NAudio 1.10) releases only the endpoint-volume and meter
+        // interfaces -- the AudioSessionManager it cached in BindAndUnmute is NOT among
+        // them, so release it by hand or its COM refs accumulate in audiodg.exe on every
+        // device change.
+        try { if (Device != null) Device.AudioSessionManager.Dispose(); } catch {}
         try { if (Device != null) Device.Dispose(); } catch {}
       }
     }
@@ -181,22 +186,36 @@ namespace AudioBridge {
       return chain;
     }
 
+    // Every AudioSessionControl handed out by SessionCollection[i] is a COM wrapper that
+    // must be released explicitly. Leaving them to the GC leaked handles into audiodg.exe:
+    // this loop enumerates EVERY session on the endpoint up to 30 times per call, and the
+    // call itself re-runs on every device change (BT reconnect, default-device switch,
+    // PlaybackStopped), so the leak arrives in bursts of 30 x session-count.
     static void BindAndUnmute(MMDevice dev) {
       uint pid = (uint)Process.GetCurrentProcess().Id;
       for (int t = 0; t < 30; t++) {
         try {
-          dev.AudioSessionManager.RefreshSessions();
-          var ss = dev.AudioSessionManager.Sessions;
+          var mgr = dev.AudioSessionManager;   // cached on the MMDevice; freed in OutputChain.Dispose
+          mgr.RefreshSessions();
+          var ss = mgr.Sessions;
           for (int i = 0; i < ss.Count; i++) {
             var s = ss[i];
-            if (s.GetProcessID == pid) {
-              try { s.DisplayName = "Hearken"; } catch {}
-              float v = s.SimpleAudioVolume.Volume; bool m = s.SimpleAudioVolume.Mute;
-              Console.Error.WriteLine("session: vol=" + v.ToString("0.00") + " mute=" + m);
-              if (m) s.SimpleAudioVolume.Mute = false;
-              if (v < 0.05f) s.SimpleAudioVolume.Volume = 1.0f;
-              return;
+            bool mine = false;
+            try {
+              mine = (s.GetProcessID == pid);
+              if (mine) {
+                try { s.DisplayName = "Hearken"; } catch {}
+                float v = s.SimpleAudioVolume.Volume; bool m = s.SimpleAudioVolume.Mute;
+                Console.Error.WriteLine("session: vol=" + v.ToString("0.00") + " mute=" + m);
+                if (m) s.SimpleAudioVolume.Mute = false;
+                if (v < 0.05f) s.SimpleAudioVolume.Volume = 1.0f;
+              }
+            } finally {
+              // Releasing the control wrapper does not touch the session itself, so this
+              // is safe to do even for the session we just un-muted.
+              try { s.Dispose(); } catch {}
             }
+            if (mine) return;
           }
         } catch (Exception e) { Console.Error.WriteLine("session inspect: " + e.Message); }
         Thread.Sleep(50);
