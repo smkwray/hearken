@@ -9,6 +9,7 @@ export namespace main {
 	    recvBufKB: number;
 	    playoutMs: number;
 	    volumePct: number;
+	    peerTimeoutMs: number;
 	    autoStart: boolean;
 	
 	    static createFrom(source: any = {}) {
@@ -25,6 +26,7 @@ export namespace main {
 	        this.recvBufKB = source["recvBufKB"];
 	        this.playoutMs = source["playoutMs"];
 	        this.volumePct = source["volumePct"];
+	        this.peerTimeoutMs = source["peerTimeoutMs"];
 	        this.autoStart = source["autoStart"];
 	    }
 	}
@@ -61,6 +63,7 @@ export namespace main {
 	    captureMs: number;
 	    recvBufKB: number;
 	    playoutMs: number;
+	    peerTimeoutMs: number;
 	    volumePct: number;
 	    autoStart: boolean;
 	    missingDeps: string[];
@@ -92,6 +95,7 @@ export namespace main {
 	        this.captureMs = source["captureMs"];
 	        this.recvBufKB = source["recvBufKB"];
 	        this.playoutMs = source["playoutMs"];
+	        this.peerTimeoutMs = source["peerTimeoutMs"];
 	        this.volumePct = source["volumePct"];
 	        this.autoStart = source["autoStart"];
 	        this.missingDeps = source["missingDeps"];
