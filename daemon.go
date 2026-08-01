@@ -87,7 +87,7 @@ func (a *App) dispatch(m string, args []json.RawMessage) any {
 	case "SetVolume":
 		return a.SetVolume(n(0))
 	case "ApplyParams":
-		return a.ApplyParams(n(0), n(1), n(2), n(3))
+		return a.ApplyParams(n(0), n(1), n(2), n(3), n(4))
 	case "Toggle":
 		return a.Toggle()
 	case "Verify":

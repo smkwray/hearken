@@ -52,11 +52,32 @@ type Config struct {
 	RecvBufKB int    `json:"recvBufKB"`
 	PlayoutMs int    `json:"playoutMs"` // playout jitter-buffer cap (ms) — the main crackle vs latency knob
 	VolumePct int    `json:"volumePct"` // playback gain on THIS device, 0-100 (100 = unity)
-	AutoStart bool   `json:"autoStart"`
+	// PeerTimeoutMs is how long a leg waits for bytes before declaring the link dead
+	// and letting the supervisor relaunch it. Too low and a leg with no peer connected
+	// restarts every few seconds forever; on macOS each restart opens a fresh AudioQueue
+	// against coreaudiod, which starves the capture leg feeding the peer.
+	PeerTimeoutMs int  `json:"peerTimeoutMs"`
+	AutoStart     bool `json:"autoStart"`
 }
 
 func defaultConfig() Config {
-	return Config{PeerIP: "", Role: "", Direction: "both", SndBufKB: 16, CaptureMs: 21, RecvBufKB: 16, PlayoutMs: 250, VolumePct: 100, AutoStart: true}
+	return Config{PeerIP: "", Role: "", Direction: "both", SndBufKB: 16, CaptureMs: 21, RecvBufKB: 16, PlayoutMs: 250, VolumePct: 100, PeerTimeoutMs: 8000, AutoStart: true}
+}
+
+// peerTimeoutUs renders the link read timeout for ffmpeg's tcp: URL, in microseconds.
+// Clamped 2s–120s; 0/unset falls back to the 8s default so old config files still work.
+func peerTimeoutUs(cfg Config) int {
+	ms := cfg.PeerTimeoutMs
+	if ms == 0 {
+		ms = 8000
+	}
+	if ms < 2000 {
+		ms = 2000
+	}
+	if ms > 120000 {
+		ms = 120000
+	}
+	return ms * 1000
 }
 
 // playoutArg renders the playout buffer cap (ms, clamped 80-800) for play.exe.
@@ -357,6 +378,7 @@ type Status struct {
 	CaptureMs     int      `json:"captureMs"`
 	RecvBufKB     int      `json:"recvBufKB"`
 	PlayoutMs     int      `json:"playoutMs"`
+	PeerTimeoutMs int      `json:"peerTimeoutMs"`
 	VolumePct     int      `json:"volumePct"`
 	AutoStart     bool     `json:"autoStart"`
 	MissingDeps   []string `json:"missingDeps"`
@@ -389,7 +411,8 @@ func (a *App) GetStatus() Status {
 	s := Status{
 		OS: runtime.GOOS, PeerIP: cfg.PeerIP, Active: active, PingMs: -1,
 		Direction: cfg.Direction, SndBufKB: cfg.SndBufKB, CaptureMs: cfg.CaptureMs,
-		RecvBufKB: cfg.RecvBufKB, PlayoutMs: cfg.PlayoutMs, VolumePct: cfg.VolumePct, AutoStart: cfg.AutoStart,
+		RecvBufKB: cfg.RecvBufKB, PlayoutMs: cfg.PlayoutMs, VolumePct: cfg.VolumePct,
+		PeerTimeoutMs: peerTimeoutUs(cfg) / 1000, AutoStart: cfg.AutoStart,
 		MissingDeps: a.CheckDeps(), Note: note,
 	}
 	s.Role = roleName(cfg)
@@ -710,40 +733,78 @@ func (a *App) Stop() string {
 	return "Stopped"
 }
 
+// backoff limits for a failing leg.
+const (
+	minRelaunchWait = time.Second
+	maxRelaunchWait = 30 * time.Second
+	healthyRun      = 30 * time.Second // a child that lasted this long was doing its job
+)
+
+// growWait doubles d, capped at maxRelaunchWait.
+func growWait(d time.Duration) time.Duration {
+	if d *= 2; d > maxRelaunchWait {
+		return maxRelaunchWait
+	}
+	return d
+}
+
 // supervise runs one role's child, restarting it if it exits while active.
+//
+// The wait between relaunches grows while the child keeps dying fast and resets once
+// one survives. That matters more than it looks: a leg with no peer on its socket exits
+// every peerTimeout, and on macOS each relaunch opens a fresh AudioQueue against
+// coreaudiod — a leg nobody is listening to can starve the capture leg that is actually
+// carrying audio. A fixed 1s retry made that a permanent, self-inflicted load.
 func (a *App) supervise(ctx context.Context, r role, cfg Config) {
 	defer a.wg.Done()
+	wait := minRelaunchWait
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		cmd := a.buildCmd(ctx, r, cfg)
+		cmd, retryable := a.buildCmd(ctx, r, cfg)
 		if cmd == nil {
-			// Unimplemented role for this OS (a stubbed same-OS cell). Don't spin.
-			logf("supervise role=%d: no command on this OS — not supervising", r)
-			return
+			if !retryable {
+				// Unimplemented role for this OS (a stubbed same-OS cell). Don't spin.
+				logf("supervise role=%d: no command on this OS — not supervising", r)
+				return
+			}
+			logf("supervise role=%d: prerequisite unavailable, retrying in %v", r, wait)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(wait):
+			}
+			wait = growWait(wait)
+			continue
 		}
 		hideWindow(cmd) // no console-window flash on Windows
 		logf("supervise role=%d exec=%s args=%v", r, cmd.Path, cmd.Args[1:])
 		d, _ := os.UserConfigDir()
 		lp := filepath.Join(d, "hearken", "hearken.log")
 		rotateLog(lp)
+		started := time.Now()
 		if lf, e := os.OpenFile(lp, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); e == nil {
 			cmd.Stdout, cmd.Stderr = lf, lf
 			err := cmd.Run()
 			lf.Close()
-			logf("supervise role=%d exited err=%v", r, err)
+			logf("supervise role=%d exited after %v err=%v", r, time.Since(started).Round(time.Millisecond), err)
 		} else {
 			err := cmd.Run()
-			logf("supervise role=%d exited (no logfile) err=%v", r, err)
+			logf("supervise role=%d exited after %v (no logfile) err=%v", r, time.Since(started).Round(time.Millisecond), err)
 		}
 		if ctx.Err() != nil {
 			return
 		}
+		if time.Since(started) >= healthyRun {
+			wait = minRelaunchWait
+		} else {
+			wait = growWait(wait)
+		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(time.Second): // brief backoff, then relaunch
+		case <-time.After(wait):
 		}
 	}
 }
@@ -751,8 +812,26 @@ func (a *App) supervise(ctx context.Context, r role, cfg Config) {
 // buildCmd resolves a role to the actual child process for THIS OS. The matrix has
 // four working cells (Mac host + Windows client, the original bridge) and three
 // future cells stubbed with TODOs so same-OS pairing can be completed + tested later.
-func (a *App) buildCmd(ctx context.Context, r role, cfg Config) *exec.Cmd {
+// The bool reports whether a nil command is worth retrying: false means this role is
+// not implemented on this OS (stop supervising it), true means a prerequisite is
+// temporarily missing (e.g. no output device resolvable) and the supervisor should
+// back off and try again rather than give up or launch a doomed child.
+func (a *App) buildCmd(ctx context.Context, r role, cfg Config) (*exec.Cmd, bool) {
 	mac := runtime.GOOS == "darwin"
+
+	// macPlay builds an ffmpeg playback leg, refusing to launch when the real output
+	// device cannot be resolved — a guessed index lands on an input-only device and
+	// ffmpeg dies instantly, which is precisely the loop this must not start.
+	macPlay := func(input string) (*exec.Cmd, bool) {
+		idx := a.realOutputIndex()
+		if idx == "" {
+			logf("role=%d: no real output device resolvable — deferring playback leg", r)
+			return nil, true
+		}
+		logf("role=%d: playback output device index=%s", r, idx)
+		return ffmpegPlay(ctx, input, idx, gainArg(cfg)), true
+	}
+
 	switch r {
 
 	case roleHostCapServe: // capture my system audio, serve it on hearPort
@@ -762,47 +841,47 @@ func (a *App) buildCmd(ctx context.Context, r role, cfg Config) *exec.Cmd {
 			c.Env = append(os.Environ(),
 				fmt.Sprintf("BRIDGE_SNDBUF=%d", cfg.SndBufKB*1024),
 				fmt.Sprintf("BRIDGE_AQ_BUF_BYTES=%d", cfg.CaptureMs*48*4))
-			return c
+			return c, true
 		}
 		// TODO(win-host): capture.exe needs a server mode:
 		//   capture.exe --listen <port>  (WASAPI loopback -> accept TCP -> stream s16le/48k/stereo)
 		logf("UNIMPLEMENTED: Windows host capture-serve (needs capture.exe --listen %d)", hearPort)
-		return nil
+		return nil, false
 
 	case roleHostPlayServe: // listen on talkPort, play received audio
 		if mac {
-			// timeout (µs): the sender keepalives every ≤2s even while squelched, so 8s
-			// with no bytes = half-open link (peer slept/vanished). ffmpeg exits, the
-			// supervisor relaunches it, and it listens again. Without this, one stale
-			// client wedges the single-accept listener forever and every redial from
-			// the peer is refused.
-			return ffmpegPlay(ctx, fmt.Sprintf("tcp://0.0.0.0:%d?listen=1&timeout=8000000", talkPort), a.realOutputIndex(), gainArg(cfg))
+			// timeout: the sender keepalives every ≤2s even while squelched, so a silent
+			// link for longer than this = half-open (peer slept/vanished). ffmpeg exits,
+			// the supervisor relaunches it, and it listens again. Without it, one stale
+			// client wedges the single-accept listener and every redial is refused.
+			// It is configurable because when NO peer is connected this fires on every
+			// cycle, and a short value turns that into a permanent relaunch loop.
+			return macPlay(fmt.Sprintf("tcp://0.0.0.0:%d?listen=1&timeout=%d", talkPort, peerTimeoutUs(cfg)))
 		}
 		// TODO(win-host): play.exe needs a server mode:
 		//   play.exe --listen <port>  (accept TCP -> WASAPI render to current default device)
 		logf("UNIMPLEMENTED: Windows host play-serve (needs play.exe --listen %d)", talkPort)
-		return nil
+		return nil, false
 
 	case roleClientPlayDial: // dial hearPort, play received audio
 		if !mac {
 			// play.exe (NAudio/WASAPI) plays to the CURRENT default device and
 			// re-binds on default-device change (BT headphones, device switch).
-			return exec.CommandContext(ctx, playExe(), cfg.PeerIP, strconv.Itoa(hearPort), gainArg(cfg), playoutArg(cfg))
+			return exec.CommandContext(ctx, playExe(), cfg.PeerIP, strconv.Itoa(hearPort), gainArg(cfg), playoutArg(cfg)), true
 		}
 		// Mac client: ffmpeg dials the host and plays to the real output device.
-		// Same 8s read timeout as the listen path to shake off a half-open link.
-		return ffmpegPlay(ctx, fmt.Sprintf("tcp://%s:%d?timeout=8000000", cfg.PeerIP, hearPort), a.realOutputIndex(), gainArg(cfg))
+		return macPlay(fmt.Sprintf("tcp://%s:%d?timeout=%d", cfg.PeerIP, hearPort, peerTimeoutUs(cfg)))
 
 	case roleClientCapDial: // dial talkPort, send my captured audio
 		if !mac {
-			return exec.CommandContext(ctx, captureExe(), cfg.PeerIP, strconv.Itoa(talkPort))
+			return exec.CommandContext(ctx, captureExe(), cfg.PeerIP, strconv.Itoa(talkPort)), true
 		}
 		// TODO(mac-client): hear-capture needs a dial mode:
 		//   connect to <peer>:<talkPort> and stream BlackHole, instead of listening.
 		logf("UNIMPLEMENTED: Mac client capture-dial (needs hear-capture dial mode to %s:%d)", cfg.PeerIP, talkPort)
-		return nil
+		return nil, false
 	}
-	return nil
+	return nil, false
 }
 
 // ffmpegPlay reads s16le/48k/stereo from a TCP input (dial "tcp://host:port" or
@@ -822,14 +901,30 @@ func ffmpegPlay(ctx context.Context, input, deviceIdx, gain string) *exec.Cmd {
 	return exec.CommandContext(ctx, ffmpegPath(), args...)
 }
 
+// realOutputIndex resolves the raw kAudioHardwarePropertyDevices index of a REAL
+// output device (never BlackHole, never the Bridge Out aggregate) for ffmpeg's
+// -audio_device_index. Returns "" when none can be resolved.
+//
+// It must NOT guess. That raw list interleaves INPUT-ONLY devices — on a MacBook
+// index 5 is the built-in microphone (0 output channels) and index 6 the speakers —
+// so a wrong number makes AudioQueueStart fail with -66637. The previous "0"
+// fallback was such a guess, and index 0 is routinely a microphone.
+//
+// The index is also positional, so it is resolved immediately before each launch:
+// any device appearing or disappearing (USB interfaces, virtual devices) shifts
+// every later index.
 func (a *App) realOutputIndex() string {
 	out, err := run(4*time.Second, filepath.Join(abDir(), "find-output-index"))
-	if err == nil {
-		if v := strings.TrimSpace(out); v != "" {
-			return v
-		}
+	if err != nil {
+		logf("find-output-index failed: %v", err)
+		return ""
 	}
-	return "0"
+	v := strings.TrimSpace(out)
+	if v == "" {
+		logf("find-output-index resolved no real output device")
+		return ""
+	}
+	return v
 }
 
 func (a *App) ensureBridgeOut() {
@@ -915,10 +1010,10 @@ func (a *App) SetRole(r string) string {
 	return a.restart()
 }
 
-func (a *App) ApplyParams(sndKB, captureMs, recvKB, playoutMs int) string {
+func (a *App) ApplyParams(sndKB, captureMs, recvKB, playoutMs, peerTimeoutMs int) string {
 	if a.daemon != "" {
 		var r string
-		json.Unmarshal(a.rpc("ApplyParams", sndKB, captureMs, recvKB, playoutMs), &r)
+		json.Unmarshal(a.rpc("ApplyParams", sndKB, captureMs, recvKB, playoutMs, peerTimeoutMs), &r)
 		return r
 	}
 	a.mu.Lock()
@@ -933,6 +1028,9 @@ func (a *App) ApplyParams(sndKB, captureMs, recvKB, playoutMs int) string {
 	}
 	if playoutMs >= 50 {
 		a.cfg.PlayoutMs = playoutMs
+	}
+	if peerTimeoutMs >= 2000 {
+		a.cfg.PeerTimeoutMs = peerTimeoutMs
 	}
 	a.saveConfig()
 	a.mu.Unlock()
