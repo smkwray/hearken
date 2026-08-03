@@ -90,6 +90,8 @@ func (a *App) dispatch(m string, args []json.RawMessage) any {
 		return a.ApplyParams(n(0), n(1), n(2), n(3), n(4))
 	case "Toggle":
 		return a.Toggle()
+	case "MarkGlitch":
+		return a.MarkGlitch()
 	case "Verify":
 		return a.Verify()
 	case "DiscoverPeers":

@@ -61,36 +61,179 @@ var sendPending = Data()
 var senderDead = false
 let sendPendingMax = 96 * 1024      // ~0.5s ceiling during a stall, then drop-oldest
 let mainLoop = CFRunLoopGetCurrent()
+var pendingSince = 0.0
+var captureFrames: UInt64 = 0
+var lastCallbackTime = 0.0
+var maxCallbackGapMs = 0.0
+var pendingHighWater = 0
+var dropEvents: UInt64 = 0
+var dropBytes: UInt64 = 0
+var maxDropAgeMs = 0.0
+var inFlightAgeMs = 0.0
+var writeCalls: UInt64 = 0
+var writeBytes: UInt64 = 0
+var maxWriteMs = 0.0
+var writesOver20: UInt64 = 0
+var writesOver100: UInt64 = 0
+var writesOver250: UInt64 = 0
+var effectiveSendBuffer = 0
+let dropEventCapacity = 128
+var dropEventBytes = [Int](repeating: 0, count: dropEventCapacity)
+var dropEventAgeMs = [Double](repeating: 0, count: dropEventCapacity)
+var dropEventTime = [Double](repeating: 0, count: dropEventCapacity)
+var dropEventRead = 0
+var dropEventWrite = 0
+var dropEventLost: UInt64 = 0
 
-func enqueueSend(_ p: UnsafeRawPointer, _ len: Int) {
+// Callback metrics are recorded under the existing short queue lock. Formatting
+// and log I/O remain on the sender thread, never on the AudioQueue callback.
+func recordCaptureCallback(_ len: Int, _ now: Double) {
+    sendCond.lock()
+    captureFrames += UInt64(len / 4)
+    if lastCallbackTime > 0 {
+        let gap = (now - lastCallbackTime) * 1000
+        if gap > maxCallbackGapMs { maxCallbackGapMs = gap }
+    }
+    lastCallbackTime = now
+    sendCond.unlock()
+}
+
+func enqueueSend(_ p: UnsafeRawPointer, _ len: Int, _ now: Double) {
     sendCond.lock()
     if !senderDead {
+        if sendPending.isEmpty { pendingSince = now }
         let over = sendPending.count + len - sendPendingMax
         if over > 0 {
-            sendPending.removeFirst((over + 3) / 4 * 4)  // frame-aligned drop-oldest
+            let removed = (over + 3) / 4 * 4
+            let ageMs = pendingSince > 0 ? (now - pendingSince) * 1000 : 0
+            sendPending.removeFirst(removed)  // frame-aligned drop-oldest
+            dropEvents += 1
+            dropBytes += UInt64(removed)
+            if ageMs > maxDropAgeMs { maxDropAgeMs = ageMs }
+            let next = (dropEventWrite + 1) % dropEventCapacity
+            if next == dropEventRead {
+                dropEventLost += 1
+            } else {
+                dropEventBytes[dropEventWrite] = removed
+                dropEventAgeMs[dropEventWrite] = ageMs
+                dropEventTime[dropEventWrite] = now
+                dropEventWrite = next
+            }
         }
         sendPending.append(UnsafeRawBufferPointer(start: p, count: len).bindMemory(to: UInt8.self))
+        if sendPending.count > pendingHighWater { pendingHighWater = sendPending.count }
         sendCond.signal()
     }
     sendCond.unlock()
+}
+
+// Drain the fixed numeric event ring on the sender thread. The callback only
+// stores numbers in preallocated slots; formatting and logging happen here.
+func emitDropEvents() {
+    while true {
+        sendCond.lock()
+        if dropEventRead == dropEventWrite {
+            let lost = dropEventLost
+            dropEventLost = 0
+            sendCond.unlock()
+            if lost > 0 {
+                FileHandle.standardError.write("event=sender_drop_event_overflow count=\(lost)\n".data(using: .utf8)!)
+            }
+            return
+        }
+        let bytes = dropEventBytes[dropEventRead]
+        let ageMs = dropEventAgeMs[dropEventRead]
+        let happened = dropEventTime[dropEventRead]
+        dropEventRead = (dropEventRead + 1) % dropEventCapacity
+        sendCond.unlock()
+        let delayMs = (CFAbsoluteTimeGetCurrent() - happened) * 1000
+        let line = String(format: "event=sender_drop frames=%d bytes=%d oldest_age_ms=%.1f report_delay_ms=%.1f\n",
+            bytes / 4, bytes, ageMs, delayMs)
+        FileHandle.standardError.write(line.data(using: .utf8)!)
+    }
+}
+
+func emitSenderTelemetry() {
+    let now = CFAbsoluteTimeGetCurrent()
+    sendCond.lock()
+    let pending = sendPending.count
+    let oldestMs = pending > 0 && pendingSince > 0 ? (now - pendingSince) * 1000 : 0
+    let captureFramesNow = captureFrames
+    let callbackGapNow = maxCallbackGapMs
+    let pendingHighWaterNow = pendingHighWater
+    let inFlightAgeNow = inFlightAgeMs
+    let dropEventsNow = dropEvents
+    let dropBytesNow = dropBytes
+    let maxDropAgeNow = maxDropAgeMs
+    let writeCallsNow = writeCalls
+    let writeBytesNow = writeBytes
+    let maxWriteNow = maxWriteMs
+    let writesOver20Now = writesOver20
+    let writesOver100Now = writesOver100
+    let writesOver250Now = writesOver250
+    let effectiveSendBufferNow = effectiveSendBuffer
+    maxCallbackGapMs = 0
+    pendingHighWater = pending
+    maxWriteMs = 0
+    sendCond.unlock()
+    // String construction and log I/O happen after releasing the queue lock, so
+    // the AudioQueue callback cannot wait behind either operation.
+    let line = String(format: "event=sender_metrics capture_frames=%llu callback_max_gap_ms=%.1f pending_bytes=%d pending_ms=%.1f pending_high_water=%d oldest_ms=%.1f inflight_age_ms=%.1f drop_events=%llu drop_bytes=%llu max_drop_age_ms=%.1f write_calls=%llu write_bytes=%llu max_write_ms=%.1f writes_over_20ms=%llu writes_over_100ms=%llu writes_over_250ms=%llu effective_sndbuf=%d",
+        captureFramesNow, callbackGapNow, pending, Double(pending) / 192.0, pendingHighWaterNow, oldestMs,
+        inFlightAgeNow, dropEventsNow, dropBytesNow, maxDropAgeNow, writeCallsNow, writeBytesNow, maxWriteNow,
+        writesOver20Now, writesOver100Now, writesOver250Now, effectiveSendBufferNow)
+    FileHandle.standardError.write((line + "\n").data(using: .utf8)!)
 }
 
 // startSender drains the queue to fd on its own thread; on write failure it marks
 // the link dead and stops the main run loop so we tear down and re-accept.
 func startSender(_ fd: Int32) {
     Thread.detachNewThread {
+        var lastTelemetry = CFAbsoluteTimeGetCurrent()
         while true {
             sendCond.lock()
-            while sendPending.isEmpty && !senderDead { sendCond.wait() }
+            while sendPending.isEmpty && !senderDead {
+                _ = sendCond.wait(until: Date(timeIntervalSinceNow: 1.0))
+                if CFAbsoluteTimeGetCurrent() - lastTelemetry >= 1.0 { break }
+            }
             if senderDead { sendCond.unlock(); return }
+            if sendPending.isEmpty {
+                sendCond.unlock()
+                emitDropEvents()
+                emitSenderTelemetry()
+                lastTelemetry = CFAbsoluteTimeGetCurrent()
+                continue
+            }
+            let now = CFAbsoluteTimeGetCurrent()
+            inFlightAgeMs = pendingSince > 0 ? (now - pendingSince) * 1000 : 0
             let chunk = sendPending
             sendPending.removeAll(keepingCapacity: true)
+            pendingSince = 0
             sendCond.unlock()
+            let writeStart = CFAbsoluteTimeGetCurrent()
             let ok = chunk.withUnsafeBytes { writeAll(fd, $0.baseAddress!, chunk.count) }
+            let writeMs = (CFAbsoluteTimeGetCurrent() - writeStart) * 1000
+            sendCond.lock()
+            writeCalls += 1
+            writeBytes += UInt64(chunk.count)
+            if writeMs > maxWriteMs { maxWriteMs = writeMs }
+            if writeMs > 20 { writesOver20 += 1 }
+            if writeMs > 100 { writesOver100 += 1 }
+            if writeMs > 250 { writesOver250 += 1 }
+            inFlightAgeMs = 0
+            sendCond.unlock()
+            if writeMs > 20 {
+                FileHandle.standardError.write(String(format: "event=sender_slow_write bytes=%d duration_ms=%.1f\n", chunk.count, writeMs).data(using: .utf8)!)
+            }
+            emitDropEvents()
             if !ok {
                 sendCond.lock(); senderDead = true; sendCond.unlock()
                 CFRunLoopStop(mainLoop)
                 return
+            }
+            if CFAbsoluteTimeGetCurrent() - lastTelemetry >= 1.0 {
+                emitSenderTelemetry()
+                lastTelemetry = CFAbsoluteTimeGetCurrent()
             }
         }
     }
@@ -102,13 +245,14 @@ let cb: AudioQueueInputCallback = { _, queue, bufRef, _, _, _ in
     let len = Int(b.mAudioDataByteSize)
     if clientFD >= 0, len > 0 {
         let now = CFAbsoluteTimeGetCurrent()
+        recordCaptureCallback(len, now)
         let silent = bufferIsSilent(b.mAudioData, len, squelchThreshold)
         if !silent { lastSoundTime = now }
         let inHold = (now - lastSoundTime) < squelchHold
         let keepalive = (now - lastSentTime) >= squelchKeepalive
         if !silent || inHold || keepalive {       // squelch: skip pure-silence buffers
             lastSentTime = now
-            enqueueSend(b.mAudioData, len)
+            enqueueSend(b.mAudioData, len, now)
         }
     }
     AudioQueueEnqueueBuffer(queue, bufRef, 0, nil)
@@ -145,6 +289,9 @@ while true {
     // Small buffer = tight coupling to the receiver = low latency. Tunable via env.
     var sndbuf = Int32(ProcessInfo.processInfo.environment["BRIDGE_SNDBUF"] ?? "16384") ?? 16384
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, socklen_t(MemoryLayout<Int32>.size))
+    var effective = Int32(0)
+    var effectiveLen = socklen_t(MemoryLayout<Int32>.size)
+    getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &effective, &effectiveLen)
     // Drop a client that vanished without a clean FIN (peer slept / lost power / crashed)
     // so we re-accept instead of streaming forever into a dead socket. TCP keepalive
     // probes the peer; SO_SNDTIMEO makes a stalled write() fail fast (the small SO_SNDBUF
@@ -162,7 +309,12 @@ while true {
     clientFD = fd
     sendCond.lock()
     sendPending.removeAll()
+    pendingSince = 0
     senderDead = false
+    effectiveSendBuffer = Int(effective)
+    dropEventRead = 0
+    dropEventWrite = 0
+    dropEventLost = 0
     sendCond.unlock()
     startSender(fd)
     lastSoundTime = CFAbsoluteTimeGetCurrent()   // fresh hold window so the new client gets audio at once

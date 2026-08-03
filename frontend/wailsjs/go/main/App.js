@@ -22,6 +22,10 @@ export function GetStatus() {
   return window['go']['main']['App']['GetStatus']();
 }
 
+export function MarkGlitch() {
+  return window['go']['main']['App']['MarkGlitch']();
+}
+
 export function SetAutoStart(arg1) {
   return window['go']['main']['App']['SetAutoStart'](arg1);
 }

@@ -14,7 +14,8 @@ processes: launch it and it just runs.
 - **Follows the default output device** on Windows (e.g. Bluetooth headphones reconnecting).
 - **Auto-discovers** hearken hosts on your Tailscale **and LAN**, or type / read off an IP.
 - **Runs headless in the menubar/tray** (≈25 MB, no browser engine resident); a config window
-  opens on demand and frees its WebView on close. Playout latency is capped (~250 ms).
+  opens on demand and frees its WebView on close. Windows playout automatically targets 140 ms
+  and corrects small clock drift without destructive buffer trims.
 
 ## How it runs
 
@@ -76,7 +77,8 @@ hearken does **not** bundle these — the installer pulls them, so there's no li
 - **Windows hears nothing, everything looks healthy** → the macOS host almost certainly lacks
   **Microphone permission** (it then streams digital silence). The signed build keeps the grant
   across rebuilds; if you rebuilt unsigned, re-grant in System Settings → Privacy → Microphone.
-- **Crackle / dropouts** → nudge the latency sliders up, or check for a competing large transfer.
+- **Crackle / dropouts** → press **Mark glitch** when you hear one, then inspect the labelled
+  sender/receiver diagnostics for a render gap, network catch-up, starvation, or device reopen.
 
 ## Status
 

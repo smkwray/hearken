@@ -4,8 +4,11 @@ node_modules
 frontend/dist
 /hearken
 
-# private/local workflow state
+# private/local workflow state — never tracked
 do/
+AGENTS.md
+CLAUDE.md
+*.plan.md
 .env
 .env.*
 .worktrees/

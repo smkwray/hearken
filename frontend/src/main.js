@@ -1,5 +1,5 @@
 import './style.css';
-import { GetStatus, SetPeerIP, SetDirection, SetRole, SetVolume, ApplyParams, Toggle, Verify, SetAutoStart, DiscoverPeers } from '../wailsjs/go/main/App';
+import { GetStatus, SetPeerIP, SetDirection, SetRole, SetVolume, ApplyParams, Toggle, Verify, MarkGlitch, SetAutoStart, DiscoverPeers } from '../wailsjs/go/main/App';
 
 const app = document.querySelector('#app');
 app.innerHTML = `
@@ -47,16 +47,16 @@ app.innerHTML = `
     </div>
 
     <div class="section">
-      <div class="sec-h">Latency <span class="hint">lower = less delay, may crackle</span></div>
-      <label class="slider" title="Jitter cushion on the listener — raise this first if you hear crackling"><span class="lbl">Playout buffer</span><input type="range" id="playout" min="80" max="500" step="20"><span class="val" id="playout-v"></span></label>
+      <div class="sec-h">Connection <span class="hint">playout adapts automatically</span></div>
+      <div class="slider disabled" title="The listener holds a 140 ms target and corrects clock drift automatically"><span class="lbl">Playout</span><span class="val">Automatic · 140 ms</span></div>
       <label class="slider" title="Chunk size the source captures"><span class="lbl">Capture</span><input type="range" id="cap" min="3" max="30" step="1"><span class="val" id="cap-v"></span></label>
       <label class="slider" title="TCP send socket buffer (advanced)"><span class="lbl">Send buffer</span><input type="range" id="snd" min="4" max="128" step="4"><span class="val" id="snd-v"></span></label>
-      <label class="slider" title="TCP receive socket buffer (advanced)"><span class="lbl">Recv buffer</span><input type="range" id="recv" min="4" max="128" step="4"><span class="val" id="recv-v"></span></label>
       <label class="slider" title="How long a leg waits for audio before deciding the link is dead and relaunching. Too low and a leg with no peer connected restarts forever, which loads the audio system."><span class="lbl">Peer timeout</span><input type="range" id="peert" min="2000" max="60000" step="1000"><span class="val" id="peert-v"></span></label>
     </div>
 
     <div class="actions">
       <button class="btn ghost" id="verify">Verify</button>
+      <button class="btn ghost" id="mark">Mark glitch</button>
       <button class="btn" id="apply">Apply ⟳</button>
     </div>
 
@@ -68,13 +68,13 @@ app.innerHTML = `
 const $ = (id) => document.getElementById(id);
 const setPill = (el, ok, na) => { el.classList.toggle('ok', !!ok && !na); el.classList.toggle('na', !!na); el.classList.toggle('bad', !ok && !na); };
 const msg = (t) => { $('msg').textContent = t; };
-const sv = () => { $('playout-v').textContent = $('playout').value + ' ms'; $('snd-v').textContent = $('snd').value + ' KB'; $('cap-v').textContent = $('cap').value + ' ms'; $('recv-v').textContent = $('recv').value + ' KB'; $('peert-v').textContent = ($('peert').value / 1000) + ' s'; };
-['playout', 'snd', 'cap', 'recv', 'peert'].forEach((id) => $(id).addEventListener('input', sv));
+const sv = () => { $('snd-v').textContent = $('snd').value + ' KB'; $('cap-v').textContent = $('cap').value + ' ms'; $('peert-v').textContent = ($('peert').value / 1000) + ' s'; };
+['snd', 'cap', 'peert'].forEach((id) => $(id).addEventListener('input', sv));
 
 let isWin = false, ipFocused = false, touched = false;
 $('ip').addEventListener('focus', () => ipFocused = true);
 $('ip').addEventListener('blur', () => ipFocused = false);
-['playout', 'snd', 'cap', 'recv', 'peert'].forEach((id) => $(id).addEventListener('input', () => touched = true));
+['snd', 'cap', 'peert'].forEach((id) => $(id).addEventListener('input', () => touched = true));
 
 async function refresh() {
   let s; try { s = await GetStatus(); } catch (e) { msg('backend error: ' + e); return; }
@@ -130,23 +130,20 @@ async function refresh() {
   document.querySelectorAll('#role button').forEach((b) => b.classList.toggle('active', b.dataset.role === (s.roleMode || '')));
   $('rolebadge').textContent = s.role ? ' · ' + s.role : '';
 
-  // Playout buffer is the listener's lever (client side); Send/Capture are the source's (host side).
-  // Peer timeout governs the macOS ffmpeg legs, so it belongs to the Mac like Send/Capture.
-  $('recv').disabled = !isWin; $('playout').disabled = !isWin; $('snd').disabled = isWin; $('cap').disabled = isWin;
+  // Playout is automatic. Send/Capture and peer timeout are source-side policy.
+  $('snd').disabled = isWin; $('cap').disabled = isWin;
   $('peert').disabled = isWin;
   $('snd').closest('.slider').classList.toggle('disabled', isWin);
   $('cap').closest('.slider').classList.toggle('disabled', isWin);
   $('peert').closest('.slider').classList.toggle('disabled', isWin);
-  $('recv').closest('.slider').classList.toggle('disabled', !isWin);
-  $('playout').closest('.slider').classList.toggle('disabled', !isWin);
   $('autostart').checked = !!s.autoStart;
 
-  if (!touched) { $('playout').value = s.playoutMs; $('snd').value = s.sndBufKB; $('cap').value = s.captureMs; $('recv').value = s.recvBufKB; $('peert').value = s.peerTimeoutMs; sv(); }
+  if (!touched) { $('snd').value = s.sndBufKB; $('cap').value = s.captureMs; $('peert').value = s.peerTimeoutMs; sv(); }
   if ($('vol') !== document.activeElement) { $('vol').value = s.volumePct; $('vol-v').textContent = s.volumePct + '%'; }
 
   // A grayed slider is the OTHER machine's lever — show where to set it instead of a stale value.
   const peerName = s.peer || 'the peer';
-  ['playout', 'cap', 'snd', 'recv', 'peert'].forEach((id) => {
+  ['cap', 'snd', 'peert'].forEach((id) => {
     const v = $(id + '-v');
     if ($(id).disabled) { v.textContent = 'set on ' + peerName; v.classList.add('elsewhere'); }
     else v.classList.remove('elsewhere');
@@ -181,7 +178,8 @@ $('scan').addEventListener('click', async () => {
 document.querySelectorAll('#dir button').forEach((b) => b.addEventListener('click', async () => { msg('switching…'); msg(await SetDirection(b.dataset.dir)); setTimeout(refresh, 700); }));
 document.querySelectorAll('#role button').forEach((b) => b.addEventListener('click', async () => { msg('switching mode…'); msg(await SetRole(b.dataset.role)); setTimeout(refresh, 700); }));
 $('verify').addEventListener('click', async () => { msg('verifying…'); msg(await Verify()); });
-$('apply').addEventListener('click', async () => { msg('applying…'); const r = await ApplyParams(parseInt($('snd').value), parseInt($('cap').value), parseInt($('recv').value), parseInt($('playout').value), parseInt($('peert').value)); touched = false; msg(r); setTimeout(refresh, 800); });
+$('mark').addEventListener('click', async () => { msg(await MarkGlitch()); });
+$('apply').addEventListener('click', async () => { msg('applying…'); const r = await ApplyParams(parseInt($('snd').value), parseInt($('cap').value), 16, 140, parseInt($('peert').value)); touched = false; msg(r); setTimeout(refresh, 800); });
 $('autostart').addEventListener('change', async () => { await SetAutoStart($('autostart').checked); });
 $('vol').addEventListener('input', () => { $('vol-v').textContent = $('vol').value + '%'; });
 $('vol').addEventListener('change', async () => { msg('volume ' + $('vol').value + '%…'); msg(await SetVolume(parseInt($('vol').value))); setTimeout(refresh, 700); });

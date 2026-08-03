@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"debug/macho"
@@ -49,8 +50,8 @@ type Config struct {
 	Direction string `json:"direction"` // both | hostToClient (legacy mac2win) | clientToHost (legacy win2mac)
 	SndBufKB  int    `json:"sndBufKB"`
 	CaptureMs int    `json:"captureMs"`
-	RecvBufKB int    `json:"recvBufKB"`
-	PlayoutMs int    `json:"playoutMs"` // playout jitter-buffer cap (ms) — the main crackle vs latency knob
+	RecvBufKB int    `json:"recvBufKB"` // legacy config field; retained for compatible config reads
+	PlayoutMs int    `json:"playoutMs"` // legacy config field; adaptive Windows playout owns its 140 ms target
 	VolumePct int    `json:"volumePct"` // playback gain on THIS device, 0-100 (100 = unity)
 	// PeerTimeoutMs is how long a leg waits for bytes before declaring the link dead
 	// and letting the supervisor relaunch it. Too low and a leg with no peer connected
@@ -61,7 +62,7 @@ type Config struct {
 }
 
 func defaultConfig() Config {
-	return Config{PeerIP: "", Role: "", Direction: "both", SndBufKB: 16, CaptureMs: 21, RecvBufKB: 16, PlayoutMs: 250, VolumePct: 100, PeerTimeoutMs: 8000, AutoStart: true}
+	return Config{PeerIP: "", Role: "", Direction: "both", SndBufKB: 16, CaptureMs: 21, RecvBufKB: 16, PlayoutMs: 140, VolumePct: 100, PeerTimeoutMs: 8000, AutoStart: true}
 }
 
 // peerTimeoutUs renders the link read timeout for ffmpeg's tcp: URL, in microseconds.
@@ -78,18 +79,6 @@ func peerTimeoutUs(cfg Config) int {
 		ms = 120000
 	}
 	return ms * 1000
-}
-
-// playoutArg renders the playout buffer cap (ms, clamped 80-800) for play.exe.
-func playoutArg(cfg Config) string {
-	v := cfg.PlayoutMs
-	if v < 80 {
-		v = 80
-	}
-	if v > 800 {
-		v = 800
-	}
-	return strconv.Itoa(v)
 }
 
 // gainArg renders this device's playback gain (0.000–1.000) for play.exe / ffmpeg.
@@ -149,15 +138,17 @@ func containsRole(rs []role, want role) bool {
 }
 
 type App struct {
-	ctx    context.Context
-	mu     sync.Mutex
-	cfg    Config
-	active bool
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
-	note   string
-	daemon string       // "" = run the bridge locally (daemon mode); non-"" = proxy to that URL (window mode)
-	hc     *http.Client // window mode HTTP client
+	ctx         context.Context
+	mu          sync.Mutex
+	cfg         Config
+	active      bool
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
+	logMu       sync.Mutex
+	note        string
+	bridgeStart time.Time
+	daemon      string       // "" = run the bridge locally (daemon mode); non-"" = proxy to that URL (window mode)
+	hc          *http.Client // window mode HTTP client
 }
 
 // NewApp creates the daemon-mode App that actually owns the bridge.
@@ -215,8 +206,8 @@ func (a *App) autoStart() {
 
 // ---- paths / helpers ----------------------------------------------------
 
-func home() string { h, _ := os.UserHomeDir(); return h }
-func abDir() string { return filepath.Join(home(), "audio-bridge") }
+func home() string         { h, _ := os.UserHomeDir(); return h }
+func abDir() string        { return filepath.Join(home(), "audio-bridge") }
 func exists(p string) bool { _, err := os.Stat(p); return err == nil }
 
 // nativeExec reports whether the Mach-O at path can run natively on this host —
@@ -319,6 +310,9 @@ func (a *App) loadConfig() Config {
 	if b, err := os.ReadFile(configPath()); err == nil {
 		_ = json.Unmarshal(b, &c)
 	}
+	// Playout is now an internal adaptive policy. Normalize stale troubleshooting
+	// values (notably 450 ms) so status and future saves do not imply a live knob.
+	c.PlayoutMs = 140
 	return c
 }
 func (a *App) saveConfig() {
@@ -362,31 +356,31 @@ func (a *App) CheckDeps() []string {
 // ---- status -------------------------------------------------------------
 
 type Status struct {
-	OS            string   `json:"os"`
-	Self          string   `json:"self"`
-	Peer          string   `json:"peer"`
-	PeerIP        string   `json:"peerIP"`
-	Active        bool     `json:"active"`
-	BlackHole     bool     `json:"blackHole"`
-	BridgeOut     bool     `json:"bridgeOut"`
-	HearUp        bool     `json:"hearUp"`
-	TalkUp        bool     `json:"talkUp"`
-	PeerConnected bool     `json:"peerConnected"`
-	PingMs        int      `json:"pingMs"`
-	Direction     string   `json:"direction"`
-	SndBufKB      int      `json:"sndBufKB"`
-	CaptureMs     int      `json:"captureMs"`
-	RecvBufKB     int      `json:"recvBufKB"`
-	PlayoutMs     int      `json:"playoutMs"`
-	PeerTimeoutMs int      `json:"peerTimeoutMs"`
-	VolumePct     int      `json:"volumePct"`
-	AutoStart     bool     `json:"autoStart"`
-	MissingDeps   []string `json:"missingDeps"`
-	Note          string   `json:"note"`
-	Role            string `json:"role"`            // resolved: "host" (listens) | "client" (dials)
-	RoleMode        string `json:"roleMode"`        // raw setting: "" (auto) | "host" | "client"
-	SelfTailscaleIP string `json:"selfTailscaleIP"` // this device's Tailscale IP (for the peer to dial)
-	SelfLANIP       string `json:"selfLANIP"`       // this device's LAN IP
+	OS              string   `json:"os"`
+	Self            string   `json:"self"`
+	Peer            string   `json:"peer"`
+	PeerIP          string   `json:"peerIP"`
+	Active          bool     `json:"active"`
+	BlackHole       bool     `json:"blackHole"`
+	BridgeOut       bool     `json:"bridgeOut"`
+	HearUp          bool     `json:"hearUp"`
+	TalkUp          bool     `json:"talkUp"`
+	PeerConnected   bool     `json:"peerConnected"`
+	PingMs          int      `json:"pingMs"`
+	Direction       string   `json:"direction"`
+	SndBufKB        int      `json:"sndBufKB"`
+	CaptureMs       int      `json:"captureMs"`
+	RecvBufKB       int      `json:"recvBufKB"`
+	PlayoutMs       int      `json:"playoutMs"`
+	PeerTimeoutMs   int      `json:"peerTimeoutMs"`
+	VolumePct       int      `json:"volumePct"`
+	AutoStart       bool     `json:"autoStart"`
+	MissingDeps     []string `json:"missingDeps"`
+	Note            string   `json:"note"`
+	Role            string   `json:"role"`            // resolved: "host" (listens) | "client" (dials)
+	RoleMode        string   `json:"roleMode"`        // raw setting: "" (auto) | "host" | "client"
+	SelfTailscaleIP string   `json:"selfTailscaleIP"` // this device's Tailscale IP (for the peer to dial)
+	SelfLANIP       string   `json:"selfLANIP"`       // this device's LAN IP
 }
 
 // PeerInfo is a Tailscale peer that is reachable AND has a hearken host port open.
@@ -649,14 +643,30 @@ func lanCandidates() []string {
 type role int
 
 // Roles are defined by (transport side × audio leg), independent of OS:
-//   hearPort (45000) carries the HOST's audio -> client.
-//   talkPort (45001) carries the CLIENT's audio -> host.
+//
+//	hearPort (45000) carries the HOST's audio -> client.
+//	talkPort (45001) carries the CLIENT's audio -> host.
 const (
 	roleHostCapServe   role = iota // host: capture my audio, SERVE on hearPort (listen+accept)
 	roleHostPlayServe              // host: LISTEN on talkPort, play received audio
 	roleClientPlayDial             // client: DIAL hearPort, play received audio
 	roleClientCapDial              // client: DIAL talkPort, send my captured audio
 )
+
+func (r role) label() string {
+	switch r {
+	case roleHostCapServe:
+		return "host-cap-serve"
+	case roleHostPlayServe:
+		return "host-play-serve"
+	case roleClientPlayDial:
+		return "client-play-dial"
+	case roleClientCapDial:
+		return "client-cap-dial"
+	default:
+		return "unknown"
+	}
+}
 
 // rolesForDirection picks this machine's roles from the direction + whether it is the host.
 func rolesForDirection(dir string, host bool) []role {
@@ -700,6 +710,7 @@ func (a *App) Start() string {
 	ctx, cancel := context.WithCancel(context.Background())
 	a.cancel = cancel
 	a.active = true
+	a.bridgeStart = time.Now()
 	a.note = "starting…"
 	roles := rolesForDirection(cfg.Direction, isHost(cfg))
 	a.mu.Unlock()
@@ -748,6 +759,91 @@ func growWait(d time.Duration) time.Duration {
 	return d
 }
 
+func (a *App) writeChildLine(f *os.File, bridgeStart time.Time, r role, generation, pid int, streamID, source, line string) {
+	a.logMu.Lock()
+	defer a.logMu.Unlock()
+	fmt.Fprintf(f, "wall=%s mono_ns=%d role=%s pid=%d generation=%d stream=%s source=%s msg=%s\n",
+		time.Now().UTC().Format(time.RFC3339Nano), time.Since(bridgeStart).Nanoseconds(), r.label(),
+		pid, generation, streamID, source, strconv.Quote(line))
+}
+
+func (a *App) pumpChildLines(f *os.File, bridgeStart time.Time, r role, generation, pid int, streamID, source string, scanner *bufio.Scanner, done *sync.WaitGroup) {
+	defer done.Done()
+	scanner.Buffer(make([]byte, 4096), 1<<20)
+	for scanner.Scan() {
+		a.writeChildLine(f, bridgeStart, r, generation, pid, streamID, source, scanner.Text())
+	}
+	if err := scanner.Err(); err != nil {
+		a.writeChildLine(f, bridgeStart, r, generation, pid, streamID, "supervisor", "line_pump_error source="+source+" error="+err.Error())
+	}
+}
+
+func pathType(peer string) string {
+	ip := net.ParseIP(strings.TrimSpace(peer)).To4()
+	if ip == nil {
+		return "unknown"
+	}
+	// Tailscale IPv4 addresses occupy 100.64.0.0/10. Other private addresses
+	// are plain LAN routes for the purposes of this two-machine bridge.
+	if !(ip[0] == 100 && ip[1]&0xc0 == 64) {
+		if ip.IsPrivate() {
+			return "lan"
+		}
+		return "unknown"
+	}
+	out, err := run(6*time.Second, tailscaleBin(), "ping", "-c", "1", peer)
+	if err != nil {
+		return "tailscale-unknown"
+	}
+	lower := strings.ToLower(out)
+	switch {
+	case strings.Contains(lower, "derp"):
+		return "derp"
+	case strings.Contains(lower, "peer relay") || strings.Contains(lower, "peer-relay"):
+		return "peer-relay"
+	case strings.Contains(lower, "pong from"):
+		return "tailscale-direct"
+	default:
+		return "tailscale-unknown"
+	}
+}
+
+func (a *App) runChildWithTelemetry(cmd *exec.Cmd, logPath string, r role, generation int, peer string) error {
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("stdout pipe: %w", err)
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("stderr pipe: %w", err)
+	}
+	lf, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("open child log: %w", err)
+	}
+	defer lf.Close()
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+
+	a.mu.Lock()
+	bridgeStart := a.bridgeStart
+	a.mu.Unlock()
+	pid := cmd.Process.Pid
+	streamID := fmt.Sprintf("%s-%d-%d", r.label(), generation, time.Now().UnixNano())
+	var pumps sync.WaitGroup
+	pumps.Add(2)
+	go a.pumpChildLines(lf, bridgeStart, r, generation, pid, streamID, "stdout", bufio.NewScanner(stdout), &pumps)
+	go a.pumpChildLines(lf, bridgeStart, r, generation, pid, streamID, "stderr", bufio.NewScanner(stderr), &pumps)
+	a.writeChildLine(lf, bridgeStart, r, generation, pid, streamID, "supervisor", "event=child_started")
+	if peer != "" {
+		a.writeChildLine(lf, bridgeStart, r, generation, pid, streamID, "supervisor", "event=path path="+pathType(peer)+" peer="+peer)
+	}
+	err = cmd.Wait()
+	pumps.Wait()
+	return err
+}
+
 // supervise runs one role's child, restarting it if it exits while active.
 //
 // The wait between relaunches grows while the child keeps dying fast and resets once
@@ -758,6 +854,7 @@ func growWait(d time.Duration) time.Duration {
 func (a *App) supervise(ctx context.Context, r role, cfg Config) {
 	defer a.wg.Done()
 	wait := minRelaunchWait
+	generation := 0
 	for {
 		if ctx.Err() != nil {
 			return
@@ -779,20 +876,14 @@ func (a *App) supervise(ctx context.Context, r role, cfg Config) {
 			continue
 		}
 		hideWindow(cmd) // no console-window flash on Windows
-		logf("supervise role=%d exec=%s args=%v", r, cmd.Path, cmd.Args[1:])
+		generation++
+		logf("supervise role=%s generation=%d exec=%s args=%v", r.label(), generation, cmd.Path, cmd.Args[1:])
 		d, _ := os.UserConfigDir()
 		lp := filepath.Join(d, "hearken", "hearken.log")
 		rotateLog(lp)
 		started := time.Now()
-		if lf, e := os.OpenFile(lp, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); e == nil {
-			cmd.Stdout, cmd.Stderr = lf, lf
-			err := cmd.Run()
-			lf.Close()
-			logf("supervise role=%d exited after %v err=%v", r, time.Since(started).Round(time.Millisecond), err)
-		} else {
-			err := cmd.Run()
-			logf("supervise role=%d exited after %v (no logfile) err=%v", r, time.Since(started).Round(time.Millisecond), err)
-		}
+		err := a.runChildWithTelemetry(cmd, lp, r, generation, cfg.PeerIP)
+		logf("supervise role=%s generation=%d exited after %v err=%v", r.label(), generation, time.Since(started).Round(time.Millisecond), err)
 		if ctx.Err() != nil {
 			return
 		}
@@ -867,7 +958,7 @@ func (a *App) buildCmd(ctx context.Context, r role, cfg Config) (*exec.Cmd, bool
 		if !mac {
 			// play.exe (NAudio/WASAPI) plays to the CURRENT default device and
 			// re-binds on default-device change (BT headphones, device switch).
-			return exec.CommandContext(ctx, playExe(), cfg.PeerIP, strconv.Itoa(hearPort), gainArg(cfg), playoutArg(cfg)), true
+			return exec.CommandContext(ctx, playExe(), cfg.PeerIP, strconv.Itoa(hearPort), gainArg(cfg)), true
 		}
 		// Mac client: ffmpeg dials the host and plays to the real output device.
 		return macPlay(fmt.Sprintf("tcp://%s:%d?timeout=%d", cfg.PeerIP, hearPort, peerTimeoutUs(cfg)))
@@ -1084,6 +1175,26 @@ func (a *App) Toggle() string {
 		return a.Stop()
 	}
 	return a.Start()
+}
+
+// MarkGlitch records the owner's audible observation on the supervisor's common
+// monotonic clock so it can be joined to sender, receiver, link, and device events.
+func (a *App) MarkGlitch() string {
+	if a.daemon != "" {
+		var r string
+		json.Unmarshal(a.rpc("MarkGlitch"), &r)
+		return r
+	}
+	a.mu.Lock()
+	start := a.bridgeStart
+	active := a.active
+	a.mu.Unlock()
+	if !active || start.IsZero() {
+		return "Bridge is not running."
+	}
+	mono := time.Since(start).Nanoseconds()
+	logf("event=glitch_mark mono_ns=%d", mono)
+	return "Glitch marked in diagnostics."
 }
 
 func (a *App) restart() string {

@@ -12,6 +12,8 @@ export function GetConfig():Promise<main.Config>;
 
 export function GetStatus():Promise<main.Status>;
 
+export function MarkGlitch():Promise<string>;
+
 export function SetAutoStart(arg1:boolean):Promise<string>;
 
 export function SetDirection(arg1:string):Promise<string>;
