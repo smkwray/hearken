@@ -118,7 +118,10 @@ namespace AudioBridge {
       const int SpikeWindow = 10;        // one-second peaks feeding the repeated-spike rule
       const double IdleGapMs = 500.0;    // no active-rate media for this long => suspect squelch
       const int KeepaliveBytes = 4032;   // one 21 ms AudioQueue buffer (the squelch heartbeat)
-      const short SilencePeak = 8;       // s16 peak at/below which a block carries no program
+      // Must be >= the sender's squelchThreshold (hear-capture.swift, default 16), or a
+      // keepalive reads as program and idle never fires. v1 has no way to negotiate it;
+      // protocol v2's SILENCE_START replaces this inference with a stated fact.
+      const short SilencePeak = 16;
       const int HysteresisMs = 20;
       const int HoldSecondsBeforeLower = 60;
       const int LowerStepMs = 5;
@@ -157,20 +160,34 @@ namespace AudioBridge {
       public void OnRead(long nowTicks, int bytes, short peak, double consumeRatio) {
         bool silent = peak <= SilencePeak;
         bool keepalive = silent && bytes <= KeepaliveBytes;
-        if (!silent) lastActiveTicks = nowTicks;
+
+        // Squelch detection. A keepalive-sized silent block arriving after a gap means
+        // the source stopped sending program, not that the link fell behind.
+        // It must also fire when no program has EVER been seen: a receiver that starts
+        // while the Mac is already silent would otherwise treat every keepalive gap as
+        // lateness, accrue debt without bound, and pin the target at its ceiling.
+        if (keepalive && !idle) {
+          bool longGap = lastActiveTicks == 0 ||
+                         (nowTicks - lastActiveTicks) * 1000.0 / ticksPerSecond >= IdleGapMs;
+          if (longGap) {
+            idle = true;
+            idleEnterCount++;
+            ResetEpoch(nowTicks);
+          }
+        }
 
         if (idle) {
           if (silent) { lastReadTicks = nowTicks; return; }   // still squelched: nothing to measure
           idle = false;
           idleExitCount++;
           ResetEpoch(nowTicks);                                // resumption is not lateness
-        } else if (keepalive && lastActiveTicks != 0 &&
-                   (nowTicks - lastActiveTicks) * 1000.0 / ticksPerSecond >= IdleGapMs) {
-          idle = true;
-          idleEnterCount++;
-          ResetEpoch(nowTicks);
-          return;
         }
+
+        if (!silent) lastActiveTicks = nowTicks;
+
+        // Only program audio carries lateness. Accruing debt across a silent stretch
+        // would measure how long the source was quiet, not how late the link is.
+        if (silent) { lastReadTicks = nowTicks; return; }
 
         int receivedFrames = bytes / Audio.FrameBytes;
         if (lastReadTicks != 0) {
@@ -180,6 +197,10 @@ namespace AudioBridge {
           double dueFrames = (nowTicks - lastReadTicks) / ticksPerSecond * rate;
           double debtBeforeRead = outstandingDebtFrames + dueFrames;
           if (debtBeforeRead < 0) debtBeforeRead = 0;
+          // A gap wider than the largest buffer we would ever hold is a stall, not
+          // jitter. One rebuffer answers it; proposing an unreachable target does not.
+          double cap = Audio.Frames(Audio.MaxPrebufferMs);
+          if (debtBeforeRead > cap) debtBeforeRead = cap;
           if (debtBeforeRead > oneSecondPeakFrames) oneSecondPeakFrames = debtBeforeRead;
           outstandingDebtFrames = debtBeforeRead - receivedFrames;
           if (outstandingDebtFrames < 0) outstandingDebtFrames = 0;
@@ -225,31 +246,33 @@ namespace AudioBridge {
         if (wantPrebuffer > Audio.MaxPrebufferMs) wantPrebuffer = Audio.MaxPrebufferMs;
 
         if (underrunSinceLast || wantPrebuffer > prebufferMs + HysteresisMs) {
-          if (wantPrebuffer > prebufferMs) {
+          // Arm a raise once. Re-arming the same value every second inflated the raise
+          // counter and said nothing new about the path.
+          if (wantPrebuffer > prebufferMs && wantPrebuffer > armedPrebufferMs) {
             armedPrebufferMs = wantPrebuffer;
-            reserveMs = wantReserve;
             raiseCount++;
             targetReason = underrunSinceLast ? "raise_underrun" : "raise_debt";
           }
           stableSinceTicks = nowTicks;
-          return;
+        } else {
+          // Lowering is deliberately slow: a path that just misbehaved gets a full hold
+          // before we start giving latency back, and then only in small steps.
+          if (stableSinceTicks == 0) stableSinceTicks = nowTicks;
+          if (wantPrebuffer < prebufferMs - HysteresisMs &&
+              (nowTicks - stableSinceTicks) / ticksPerSecond >= HoldSecondsBeforeLower &&
+              (lastLowerTicks == 0 || (nowTicks - lastLowerTicks) / ticksPerSecond >= LowerIntervalSeconds)) {
+            int next = prebufferMs - LowerStepMs;
+            if (next < wantPrebuffer) next = wantPrebuffer;
+            if (next < Audio.MinPrebufferMs) next = Audio.MinPrebufferMs;
+            prebufferMs = next;
+            lastLowerTicks = nowTicks;
+            lowerCount++;
+            targetReason = "lower_stable";
+          }
         }
-
-        // Lowering is deliberately slow: a path that just misbehaved gets a full hold
-        // before we start giving latency back, and then only in small steps.
-        if (stableSinceTicks == 0) stableSinceTicks = nowTicks;
-        if (wantPrebuffer < prebufferMs - HysteresisMs &&
-            (nowTicks - stableSinceTicks) / ticksPerSecond >= HoldSecondsBeforeLower &&
-            (lastLowerTicks == 0 || (nowTicks - lastLowerTicks) / ticksPerSecond >= LowerIntervalSeconds)) {
-          int next = prebufferMs - LowerStepMs;
-          if (next < wantPrebuffer) next = wantPrebuffer;
-          if (next < Audio.MinPrebufferMs) next = Audio.MinPrebufferMs;
-          prebufferMs = next;
-          reserveMs = Math.Max(Audio.MinReserveMs, prebufferMs - quantumMs);
-          lastLowerTicks = nowTicks;
-          lowerCount++;
-          targetReason = "lower_stable";
-        }
+        // Reserve always describes the target actually in force, never an armed-but-
+        // unadopted one. Reporting 390 ms of reserve behind a 40 ms buffer was incoherent.
+        reserveMs = Math.Max(Audio.MinReserveMs, prebufferMs - quantumMs);
       }
 
       // AdoptArmed promotes a raised target. The caller decides when that is safe:
@@ -1075,6 +1098,20 @@ namespace AudioBridge {
       }
       if (undersized.HardRebufferCount + undersized.SoftUnderrunCount == 0)
         throw new Exception("undersized target must starve, else the cadence test proves nothing");
+
+      // Squelch seen from a cold start. This shipped broken: idle only fired if program
+      // audio had already been seen, so a receiver that started while the Mac was
+      // silent treated every 2 s keepalive gap as lateness, accrued 14 s of debt and
+      // pinned the target at its 400 ms ceiling.
+      var pol = new ArrivalPolicy();
+      long perSec = Stopwatch.Frequency, t0 = Stopwatch.GetTimestamp();
+      for (int i = 0; i < 6; i++) pol.OnRead(t0 + (long)(i * 2.0 * perSec), 4032, 0, 1.0);
+      if (!pol.Idle) throw new Exception("silent keepalives must enter idle with no prior program");
+      pol.Recompute(t0 + (long)(12 * perSec), Audio.Frames(10), false);
+      if (pol.PrebufferMs > Audio.MinPrebufferMs + 20)
+        throw new Exception("squelch must not inflate the target");
+      pol.OnRead(t0 + (long)(14 * perSec), 9600, 3000, 1.0);
+      if (pol.Idle) throw new Exception("program audio must exit idle");
 
       // Freshness trim bounds latency without the old occupancy-only reset.
       var trim = new AdaptivePlayout();
