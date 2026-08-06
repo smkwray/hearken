@@ -1038,7 +1038,7 @@ namespace AudioBridge {
       OutputChain chain = null;
       byte[] tmp = new byte[SourceFmt.AverageBytesPerSecond / 20]; // ~50ms
       var assembler = new FrameAssembler(tmp.Length);
-      long intervalBytes = 0, lastRead = 0;
+      long intervalBytes = 0, lastRead = 0, lastHardRebuffer = 0;
       double maxReadGapMs = 0;
       int outputGeneration = 0;
       string endpoint = "none";
@@ -1099,6 +1099,16 @@ namespace AudioBridge {
             provider.PublishTarget(policy.PrebufferMs);
           } else if (!policy.Idle) {
             if (policy.AdoptArmed(provider.BufferedFrames, false)) provider.PublishTarget(policy.PrebufferMs);
+          }
+          // A hard rebuffer is the design's other adoption point, and the load-bearing one:
+          // on a degrading path occupancy never reaches a raised target by itself, so
+          // waiting for it meant the receiver could measure that it needed a bigger buffer
+          // and never take it -- 14 rebuffers in 22 s while the raise sat armed. We are
+          // already paying the interruption, so take it here.
+          long hardNow = provider.HardRebufferCount;
+          if (hardNow != lastHardRebuffer) {
+            lastHardRebuffer = hardNow;
+            if (policy.AdoptArmed(provider.BufferedFrames, true)) provider.PublishTarget(policy.PrebufferMs);
           }
           // A block the assembler withheld (squelch keepalive) must not be re-inserted
           // later, so alignment is preserved by Push regardless of the insert decision.
@@ -1280,6 +1290,24 @@ namespace AudioBridge {
       drop.ApplyIdleTarget(Audio.Frames(10));
       if (drop.PrebufferMs >= raised)
         throw new Exception("an idle gap must return the latency the measurement no longer justifies");
+
+      // A degrading path arms a raise that occupancy will never reach by itself, because
+      // the ring is starving precisely when the bigger buffer is needed. Forced adoption
+      // -- what a hard rebuffer performs -- must take it regardless of occupancy. Omitting
+      // that adoption point left the receiver measuring a need it could not act on, and it
+      // thrashed through 14 rebuffers in 22 s with the raise sitting armed.
+      var stuck = new ArrivalPolicy();
+      long s0 = Stopwatch.GetTimestamp(), st = s0;
+      for (int i = 0; i < 60; i++) {
+        st = s0 + (long)(i * 0.200 * perSec);        // 200 ms deliveries: badly bursty
+        stuck.OnRead(st, 38400, 3000, 1.0);
+        stuck.Recompute(st, Audio.Frames(10), false);
+      }
+      int floorTarget = stuck.PrebufferMs;
+      if (!stuck.AdoptArmed(1, true))
+        throw new Exception("forced adoption must take an armed raise regardless of occupancy");
+      if (stuck.PrebufferMs <= floorTarget)
+        throw new Exception("adopting the armed raise must actually raise the target");
 
       // Freshness trim bounds latency without the old occupancy-only reset.
       var trim = new AdaptivePlayout();
