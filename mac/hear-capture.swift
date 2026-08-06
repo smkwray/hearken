@@ -212,7 +212,11 @@ func startSender(_ fd: Int32) {
             while sendPending.isEmpty && !senderDead {
                 _ = sendCond.wait(until: Date(timeIntervalSinceNow: 1.0))
             }
-            if senderDead { sendCond.unlock(); return }
+            // Retire on death OR on a newer connection. Without the generation check a
+            // sender still blocked in writeAll when the run loop stopped could wake after
+            // the accept loop had cleared senderDead for a NEW connection, and drain that
+            // connection's audio into the old, closed fd.
+            if senderDead || senderGeneration != generation { sendCond.unlock(); return }
             let chunk = sendPending
             sendPending.removeAll(keepingCapacity: true)
             pendingSince = 0

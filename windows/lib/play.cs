@@ -126,6 +126,9 @@ namespace AudioBridge {
       const int HoldSecondsBeforeLower = 60;
       const int LowerStepMs = 5;
       const int LowerIntervalSeconds = 10;
+      const int ColdStartReads = 3;         // active reads that characterise the path
+      const double ColdStartObserveMs = 150.0;
+      const double ColdStartCapMs = 400.0;  // never wait longer than this before opening
 
       readonly double ticksPerSecond = Stopwatch.Frequency;
       readonly double[] structural = new double[StructuralWindow];
@@ -134,18 +137,31 @@ namespace AudioBridge {
       int structuralCount, structuralHead, spikeCount, spikeHead;
 
       long lastReadTicks, epochTicks, lastActiveTicks, lastLowerTicks, stableSinceTicks;
-      double outstandingDebtFrames, oneSecondPeakFrames, publishedDebtMs;
+      long firstActiveTicks, idleEnterTicks;
+      int activeReads;
+      double outstandingDebtFrames, oneSecondPeakFrames, publishedDebtMs, lastIdleResumeMs;
       int reserveMs = Audio.MinReserveMs;
       int prebufferMs = Audio.MinPrebufferMs;
       int armedPrebufferMs;                 // raised target waiting for a safe adoption point
       bool idle, started;
-      long idleEnterCount, idleExitCount, raiseCount, lowerCount;
+      long idleEnterCount, idleExitCount, raiseCount, lowerCount, armedExpiredCount;
       string targetReason = "init";
 
       public bool Idle { get { return idle; } }
       public int PrebufferMs { get { return prebufferMs; } }
       public int ReserveMs { get { return reserveMs; } }
       public int PrebufferFrames { get { return Audio.Frames(prebufferMs); } }
+
+      // ObservationSatisfied gates the very first output open. The design forbids a
+      // fixed measurement pause: measure while prebuffering and open as soon as either
+      // enough reads have landed to characterise the path or the observation cap expires.
+      public bool ObservationSatisfied(long nowTicks) {
+        if (firstActiveTicks == 0) return false;          // no program audio seen yet
+        double observedMs = (nowTicks - firstActiveTicks) * 1000.0 / ticksPerSecond;
+        if (observedMs >= ColdStartCapMs) return true;    // never observe longer than the cap
+        if (activeReads >= ColdStartReads) return true;
+        return observedMs >= ColdStartObserveMs;
+      }
 
       public void ResetEpoch(long nowTicks) {
         // A reconnect, explicit discontinuity or idle transition invalidates the debt
@@ -172,6 +188,7 @@ namespace AudioBridge {
           if (longGap) {
             idle = true;
             idleEnterCount++;
+            idleEnterTicks = nowTicks;
             ResetEpoch(nowTicks);
           }
         }
@@ -180,6 +197,8 @@ namespace AudioBridge {
           if (silent) { lastReadTicks = nowTicks; return; }   // still squelched: nothing to measure
           idle = false;
           idleExitCount++;
+          lastIdleResumeMs = idleEnterTicks == 0 ? 0
+            : (nowTicks - idleEnterTicks) * 1000.0 / ticksPerSecond;
           ResetEpoch(nowTicks);                                // resumption is not lateness
         }
 
@@ -189,6 +208,8 @@ namespace AudioBridge {
         // would measure how long the source was quiet, not how late the link is.
         if (silent) { lastReadTicks = nowTicks; return; }
 
+        if (firstActiveTicks == 0) firstActiveTicks = nowTicks;
+        activeReads++;
         int receivedFrames = bytes / Audio.FrameBytes;
         if (lastReadTicks != 0) {
           // Expected arrival rate is the rate the ring is actually drained at, which
@@ -229,21 +250,8 @@ namespace AudioBridge {
       // It never touches the ring; it only decides the numbers the ring will adopt.
       public void Recompute(long nowTicks, int renderQuantumFrames, bool underrunSinceLast) {
         if (!started) return;
-        double structuralDebt = Percentile(structural, structuralCount, 0.90);
-        double spikeDebt = SecondLargest(spike, spikeCount);
-        double jitterReserve = Math.Max(structuralDebt, spikeDebt);
-        publishedDebtMs = jitterReserve * 1000.0 / Audio.SampleRate;
-
         int quantumMs = Audio.Ms(renderQuantumFrames);
-        int wantReserve = (int)Math.Ceiling(publishedDebtMs) + Audio.ReserveMarginMs;
-        int reserveCeiling = Audio.MaxPrebufferMs - quantumMs;
-        if (reserveCeiling < Audio.MinReserveMs) reserveCeiling = Audio.MinReserveMs;
-        if (wantReserve < Audio.MinReserveMs) wantReserve = Audio.MinReserveMs;
-        if (wantReserve > reserveCeiling) wantReserve = reserveCeiling;
-
-        int wantPrebuffer = wantReserve + quantumMs;
-        if (wantPrebuffer < Audio.MinPrebufferMs) wantPrebuffer = Audio.MinPrebufferMs;
-        if (wantPrebuffer > Audio.MaxPrebufferMs) wantPrebuffer = Audio.MaxPrebufferMs;
+        int wantPrebuffer = WarrantedPrebufferMs(quantumMs);
 
         if (underrunSinceLast || wantPrebuffer > prebufferMs + HysteresisMs) {
           // Arm a raise once. Re-arming the same value every second inflated the raise
@@ -255,6 +263,14 @@ namespace AudioBridge {
           }
           stableSinceTicks = nowTicks;
         } else {
+          // An armed raise describes a path condition. Once the measurement no longer
+          // warrants it, it must expire: a stale 400 ms armed at start-up was later
+          // cashed in by an unrelated rebuffer and cost ~200 ms of dead latency.
+          if (armedPrebufferMs > 0 && wantPrebuffer <= armedPrebufferMs - HysteresisMs) {
+            armedPrebufferMs = 0;
+            armedExpiredCount++;
+            targetReason = "armed_expired";
+          }
           // Lowering is deliberately slow: a path that just misbehaved gets a full hold
           // before we start giving latency back, and then only in small steps.
           if (stableSinceTicks == 0) stableSinceTicks = nowTicks;
@@ -286,9 +302,43 @@ namespace AudioBridge {
         return true;
       }
 
-      public void ApplyLoweredImmediately() {
-        // An idle gap or reconnect is a free opportunity to take a lower target: no
-        // audio is playing, so there is nothing to interrupt.
+      // WarrantedPrebufferMs is what the current measurement alone justifies, before any
+      // hysteresis, hold or slew policy is applied.
+      int WarrantedPrebufferMs(int quantumMs) {
+        double structuralDebt = Percentile(structural, structuralCount, 0.90);
+        double spikeDebt = SecondLargest(spike, spikeCount);
+        publishedDebtMs = Math.Max(structuralDebt, spikeDebt) * 1000.0 / Audio.SampleRate;
+
+        int wantReserve = (int)Math.Ceiling(publishedDebtMs) + Audio.ReserveMarginMs;
+        int reserveCeiling = Audio.MaxPrebufferMs - quantumMs;
+        if (reserveCeiling < Audio.MinReserveMs) reserveCeiling = Audio.MinReserveMs;
+        if (wantReserve < Audio.MinReserveMs) wantReserve = Audio.MinReserveMs;
+        if (wantReserve > reserveCeiling) wantReserve = reserveCeiling;
+
+        int want = wantReserve + quantumMs;
+        if (want < Audio.MinPrebufferMs) want = Audio.MinPrebufferMs;
+        if (want > Audio.MaxPrebufferMs) want = Audio.MaxPrebufferMs;
+        return want;
+      }
+
+      // ApplyIdleTarget takes the whole reduction at once. Source idle or reconnect is
+      // the one moment a lower target is free -- nothing is playing, so there is nothing
+      // to interrupt -- and crawling down at 5 ms per 10 s through a silent gap only
+      // preserves latency the evidence stopped justifying.
+      public void ApplyIdleTarget(int renderQuantumFrames) {
+        int quantumMs = Audio.Ms(renderQuantumFrames);
+        int want = WarrantedPrebufferMs(quantumMs);
+        if (want < prebufferMs) {
+          prebufferMs = want;
+          lowerCount++;
+          targetReason = "lower_idle";
+        }
+        // A raise armed before the gap describes a condition that no longer holds.
+        if (armedPrebufferMs > 0 && armedPrebufferMs > want) {
+          armedPrebufferMs = 0;
+          armedExpiredCount++;
+        }
+        reserveMs = Math.Max(Audio.MinReserveMs, prebufferMs - quantumMs);
         stableSinceTicks = 0;
         lastLowerTicks = 0;
       }
@@ -315,11 +365,17 @@ namespace AudioBridge {
       }
 
       public string Describe() {
+        double p50 = Percentile(structural, structuralCount, 0.50) * 1000.0 / Audio.SampleRate;
+        double p99 = Percentile(structural, structuralCount, 0.99) * 1000.0 / Audio.SampleRate;
         return string.Format(CultureInfo.InvariantCulture,
-          "arrival_debt_ms={0:0.0} reserve_target_ms={1} prebuffer_target_ms={2} target_armed_ms={3} " +
-          "target_raise={4} target_lower={5} target_reason={6} idle_enter={7} idle_exit={8} idle={9}",
-          publishedDebtMs, reserveMs, prebufferMs, armedPrebufferMs,
-          raiseCount, lowerCount, targetReason, idleEnterCount, idleExitCount, idle ? 1 : 0);
+          "arrival_debt_ms={0:0.0} arrival_debt_p50_ms={1:0.0} arrival_debt_p99_ms={2:0.0} " +
+          "reserve_target_ms={3} prebuffer_target_ms={4} target_armed_ms={5} " +
+          "target_raise={6} target_lower={7} target_armed_expired={8} target_reason={9} " +
+          "idle_enter={10} idle_exit={11} idle_resume_ms={12:0.0} idle={13}",
+          publishedDebtMs, p50, p99,
+          reserveMs, prebufferMs, armedPrebufferMs,
+          raiseCount, lowerCount, armedExpiredCount, targetReason,
+          idleEnterCount, idleExitCount, lastIdleResumeMs, idle ? 1 : 0);
       }
     }
 
@@ -345,7 +401,11 @@ namespace AudioBridge {
       readonly byte[] ring = new byte[CapacityFrames * FrameBytes];
       readonly int[] quantumRing = new int[QuantumWindow];
       readonly int[] quantumScratch = new int[QuantumWindow];
-      int quantumCount, quantumHead;
+      readonly double[] gapRing = new double[QuantumWindow];
+      readonly double[] gapScratch = new double[QuantumWindow];
+      int quantumCount, quantumHead, gapCount, gapHead;
+      int reqP50Frames, reqP95Frames, reqP99Frames;
+      double gapP50Ms, gapP95Ms, gapP99Ms;
 
       int head, frames;
       double phase, ratio = 1.0, integralMsSeconds;
@@ -372,6 +432,7 @@ namespace AudioBridge {
       public int BufferedFrames { get { lock (gate) { return frames; } } }
       public int BufferedMs { get { lock (gate) { return Audio.Ms(frames); } } }
       public int PrebufferFrames { get { lock (gate) { return prebufferFrames; } } }
+      public int RequestQuantumFrames { get { lock (gate) { return requestQuantumFrames; } } }
       public double RatioSnapshot { get { lock (gate) { return ratio; } } }
       public long SoftUnderrunCount { get { lock (gate) { return softUnderruns; } } }
       public long HardRebufferCount { get { lock (gate) { return hardRebuffers; } } }
@@ -425,14 +486,40 @@ namespace AudioBridge {
         lock (gate) {
           underrunSinceLast = underrunsSinceRecompute > 0;
           underrunsSinceRecompute = 0;
-          if (quantumCount <= 0) return requestQuantumFrames;
-          Array.Copy(quantumRing, quantumScratch, quantumCount);
-          Array.Sort(quantumScratch, 0, quantumCount);
-          int idx = (int)Math.Ceiling(0.99 * quantumCount) - 1;
-          if (idx < 0) idx = 0;
-          if (idx >= quantumCount) idx = quantumCount - 1;
-          requestQuantumFrames = quantumScratch[idx];
+          if (quantumCount > 0) {
+            Array.Copy(quantumRing, quantumScratch, quantumCount);
+            Array.Sort(quantumScratch, 0, quantumCount);
+            reqP50Frames = quantumScratch[Rank(quantumCount, 0.50)];
+            reqP95Frames = quantumScratch[Rank(quantumCount, 0.95)];
+            reqP99Frames = quantumScratch[Rank(quantumCount, 0.99)];
+            requestQuantumFrames = reqP99Frames;
+          }
+          if (gapCount > 0) {
+            Array.Copy(gapRing, gapScratch, gapCount);
+            Array.Sort(gapScratch, 0, gapCount);
+            gapP50Ms = gapScratch[Rank(gapCount, 0.50)];
+            gapP95Ms = gapScratch[Rank(gapCount, 0.95)];
+            gapP99Ms = gapScratch[Rank(gapCount, 0.99)];
+          }
           return requestQuantumFrames;
+        }
+      }
+
+      static int Rank(int count, double q) {
+        int idx = (int)Math.Ceiling(q * count) - 1;
+        if (idx < 0) idx = 0;
+        if (idx >= count) idx = count - 1;
+        return idx;
+      }
+
+      // BeginQuantumEpoch is called when the output endpoint is (re)opened: the new
+      // device has its own period, so request and callback-gap history from the old one
+      // would misdescribe it. The network-side reserve estimate is deliberately kept.
+      public void BeginQuantumEpoch() {
+        lock (gate) {
+          quantumCount = quantumHead = 0;
+          gapCount = gapHead = 0;
+          lastCallbackTicks = 0;
         }
       }
 
@@ -522,7 +609,9 @@ namespace AudioBridge {
           underrunsSinceRecompute++;
           // The ring is deliberately NOT cleared. Whatever arrived is still good audio;
           // discarding it was the defect that turned a 1 ms shortage into 140 ms of silence.
-          integralMsSeconds = 0;
+          // The controller integral is NOT cleared either: it is reset only for a new
+          // media epoch or a changed target (AdoptTargetLocked), never for an ordinary
+          // underrun, so one shortage cannot discard the accumulated clock estimate.
           phase = 0;
           softPending = false;
         }
@@ -612,6 +701,9 @@ namespace AudioBridge {
             double gap = (double)(now - lastCallbackTicks) * 1000.0 / Stopwatch.Frequency;
             if (gap > maxCallbackGapMs) maxCallbackGapMs = gap;
             if (gap > 150.0) callbackGapEvents++;
+            gapRing[gapHead] = gap;
+            gapHead = (gapHead + 1) % QuantumWindow;
+            if (gapCount < QuantumWindow) gapCount++;
           }
           lastCallbackTicks = now;
           AdoptTargetLocked();
@@ -711,9 +803,9 @@ namespace AudioBridge {
 
       public string TakeTelemetry(long rxBytes, double rxDurationMs, double maxReadGapMs,
                                   string state, string endpoint, int generation, string renderMode,
-                                  string arrival) {
-        double ratioPpm, callbackMaxGapMs;
-        int occupancyMs, spanMs, writeBeforeMs, writeAfterMs, prebufMs, quantumMs;
+                                  int deviceBufferMs, string arrival) {
+        double ratioPpm, callbackMaxGapMs, g50, g95, g99;
+        int occupancyMs, spanMs, writeBeforeMs, writeAfterMs, prebufMs, quantumMs, r50, r95, r99;
         long callbackGaps, requested, supplied, softs, softZeros, hards, hardFrames;
         long overflows, overflowedFrames, trims, trimmedFrames, playedSourceFrames;
         bool rebuf, idleNow;
@@ -738,6 +830,8 @@ namespace AudioBridge {
           playedSourceFrames = sourceFrames;
           prebufMs = Audio.Ms(prebufferFrames);
           quantumMs = Audio.Ms(requestQuantumFrames);
+          r50 = Audio.Ms(reqP50Frames); r95 = Audio.Ms(reqP95Frames); r99 = Audio.Ms(reqP99Frames);
+          g50 = gapP50Ms; g95 = gapP95Ms; g99 = gapP99Ms;
           rebuf = rebuffering;
           idleNow = idle;
           maxCallbackGapMs = 0;
@@ -754,7 +848,10 @@ namespace AudioBridge {
           "freshness_trim={19} freshness_trim_frames={20} freshness_trim_ms={21:0.0} " +
           "overflow_events={22} overflow_frames={23} ratio_ppm={24:0.0} source_frames={25} " +
           "output_generation={26} render_mode={27} endpoint={28} state={29} rebuffering={30} {31} " +
-          "callback_gap_alert={32} occupancy_jump_alert={33}",
+          "callback_gap_alert={32} occupancy_jump_alert={33} " +
+          "render_req_p50_ms={34} render_req_p95_ms={35} render_req_p99_ms={36} " +
+          "callback_gap_p50_ms={37:0.0} callback_gap_p95_ms={38:0.0} callback_gap_p99_ms={39:0.0} " +
+          "device_buffer_ms={40}",
           rxBytes, rxDurationMs, maxReadGapMs, occupancyMs,
           writeBeforeMs, writeAfterMs, spanMs, callbackMaxGapMs, callbackGaps,
           quantumMs, prebufMs, requested, supplied,
@@ -764,7 +861,8 @@ namespace AudioBridge {
           overflows, overflowedFrames, ratioPpm, playedSourceFrames,
           generation, renderMode, endpoint == null ? "none" : endpoint.Replace(' ', '_'), state,
           rebuf ? 1 : 0, arrival,
-          callbackMaxGapMs > 150.0 ? 1 : 0, spanMs > 100 ? 1 : 0);
+          callbackMaxGapMs > 150.0 ? 1 : 0, spanMs > 100 ? 1 : 0,
+          r50, r95, r99, g50, g95, g99, deviceBufferMs);
       }
     }
 
@@ -773,28 +871,33 @@ namespace AudioBridge {
     class FrameAssembler {
       readonly byte[] joined;
       readonly byte[] tail = new byte[4];
-      int tailCount;
+      int tailCount, completeBytes;
       short lastPeak;
       public FrameAssembler(int maxRead) { joined = new byte[maxRead + 4]; }
       public int TailBytes { get { return tailCount; } }
       public short LastPeak { get { return lastPeak; } }
+      public int CompleteBytes { get { return completeBytes; } }
 
-      // Push always consumes the bytes so frame alignment survives, but inserts into
-      // the ring only when asked. While the source is squelched the keepalive carries
-      // no program, and feeding it to the ring would defeat the idle state.
-      public int Push(byte[] input, int n, float gain, AdaptivePlayout dest, bool insert) {
+      // Assemble carries the split-frame tail and measures the block's peak. It never
+      // touches the ring, because the insert decision needs the peak and the peak needs
+      // the assembled bytes: the policy must see this block BEFORE it is inserted.
+      public int Assemble(byte[] input, int n, float gain) {
         if (tailCount > 0) Buffer.BlockCopy(tail, 0, joined, 0, tailCount);
         Buffer.BlockCopy(input, 0, joined, tailCount, n);
         int total = tailCount + n;
-        int complete = total / 4 * 4;
-        tailCount = total - complete;
-        if (tailCount > 0) Buffer.BlockCopy(joined, complete, tail, 0, tailCount);
-        lastPeak = Peak(joined, complete);
-        if (complete > 0 && insert) {
-          if (gain != 1.0f) ApplyGain(joined, complete, gain);
-          dest.AddFrames(joined, 0, complete);
-        }
-        return complete;
+        completeBytes = total / 4 * 4;
+        tailCount = total - completeBytes;
+        if (tailCount > 0) Buffer.BlockCopy(joined, completeBytes, tail, 0, tailCount);
+        lastPeak = Peak(joined, completeBytes);
+        if (completeBytes > 0 && gain != 1.0f) ApplyGain(joined, completeBytes, gain);
+        return completeBytes;
+      }
+
+      // Flush hands the assembled frames to the ring. The caller skips it only while the
+      // source is squelched, so the keepalive heartbeat never becomes program material.
+      // Alignment survives either way because Assemble already consumed the bytes.
+      public void Flush(AdaptivePlayout dest) {
+        if (completeBytes > 0) dest.AddFrames(joined, 0, completeBytes);
       }
 
       // Peak is measured on the network thread, before insertion, so the render
@@ -815,6 +918,7 @@ namespace AudioBridge {
       public IDisposable Resampler;
       public WasapiOut Out;
       public string Mode = "unknown";
+      public int LatencyMs;
       public void Dispose() {
         try { if (Out != null) Out.Stop(); } catch {}
         try { if (Out != null) Out.Dispose(); } catch {}
@@ -851,13 +955,15 @@ namespace AudioBridge {
       // polling path rather than silently rendering on an untested configuration.
       WasapiOut wo = null;
       string mode = "event20";
+      int latencyMs = 20;
       try {
-        wo = new WasapiOut(dev, AudioClientShareMode.Shared, true, 20);
+        wo = new WasapiOut(dev, AudioClientShareMode.Shared, true, latencyMs);
         wo.Init(provider);
       } catch (Exception e) {
         Console.Error.WriteLine("event=render_mode_fallback reason=\"" + e.Message.Replace('"', '\'') + "\"");
         try { if (wo != null) wo.Dispose(); } catch {}
-        wo = new WasapiOut(dev, AudioClientShareMode.Shared, false, 100);
+        latencyMs = 100;
+        wo = new WasapiOut(dev, AudioClientShareMode.Shared, false, latencyMs);
         wo.Init(provider);
         mode = "polling_fallback";
       }
@@ -867,9 +973,14 @@ namespace AudioBridge {
       };
       wo.Play();
       BindAndUnmute(dev);
-      Console.Error.WriteLine("playing WASAPI shared, mode=" + mode + ", state=" + wo.PlaybackState);
+      Console.Error.WriteLine("playing WASAPI shared, mode=" + mode + ", buffer_ms=" + latencyMs +
+        ", state=" + wo.PlaybackState);
       var chain = new OutputChain();
-      chain.Device = dev; chain.Resampler = null; chain.Out = wo; chain.Mode = mode;
+      chain.Device = dev; chain.Resampler = null; chain.Out = wo;
+      chain.Mode = mode; chain.LatencyMs = latencyMs;
+      // A new endpoint has its own period; request/gap history from the old one would
+      // misdescribe it. The network-side reserve estimate is intentionally preserved.
+      provider.BeginQuantumEpoch();
       return chain;
     }
 
@@ -945,18 +1056,19 @@ namespace AudioBridge {
           long now = sw.ElapsedMilliseconds;
           bool underrun;
           int quantum = provider.TakeRequestQuantum(out underrun);
-          long bytesNow; double gapNow; string mode; string state; string ep; int gen;
+          long bytesNow; double gapNow; string mode; string state; string ep; int gen; int devBuf;
           lock (telemetryGate) {
             bytesNow = intervalBytes; intervalBytes = 0;
             gapNow = maxReadGapMs; maxReadGapMs = 0;
             ep = endpoint; gen = outputGeneration;
             mode = chain == null ? "none" : chain.Mode;
+            devBuf = chain == null ? 0 : chain.LatencyMs;
             state = chain == null ? "prebuffer" : chain.Out.PlaybackState.ToString();
           }
           policy.Recompute(Stopwatch.GetTimestamp(), quantum, underrun);
           provider.PublishTarget(policy.PrebufferMs);
           Console.Error.WriteLine(provider.TakeTelemetry(bytesNow, now - lastEmit, gapNow,
-            state, ep, gen, mode, policy.Describe()));
+            state, ep, gen, mode, devBuf, policy.Describe()));
           lastEmit = now;
         }
       });
@@ -970,13 +1082,19 @@ namespace AudioBridge {
           long readTicks = Stopwatch.GetTimestamp();
           long readAt = sw.ElapsedMilliseconds;
           bool wasIdle = policy.Idle;
-          int complete = assembler.Push(tmp, n, gGain, provider, !wasIdle);
+          // Assemble -> classify -> insert. The policy must judge this block before it
+          // reaches the ring; deciding from the PREVIOUS idle state discarded the first
+          // block of program audio after every squelch gap.
+          int complete = assembler.Assemble(tmp, n, gGain);
           policy.OnRead(readTicks, n, assembler.LastPeak, provider.RatioSnapshot);
+          if (!policy.Idle) assembler.Flush(provider);
           if (policy.Idle != wasIdle) {
             provider.SetIdle(policy.Idle);
-            // An idle boundary is the free moment to take whatever target the estimator
-            // now wants: nothing is playing, so adopting it interrupts nothing.
-            if (policy.Idle) policy.ApplyLoweredImmediately();
+            // An idle boundary is the free moment to move the target: nothing is playing,
+            // so a change interrupts nothing. Entering idle takes the whole reduction the
+            // measurement warrants; leaving it adopts a raise only if the measurement
+            // still warrants one, so a stale armed value cannot be cashed in here.
+            if (policy.Idle) policy.ApplyIdleTarget(provider.RequestQuantumFrames);
             else policy.AdoptArmed(provider.BufferedFrames, true);
             provider.PublishTarget(policy.PrebufferMs);
           } else if (!policy.Idle) {
@@ -992,7 +1110,12 @@ namespace AudioBridge {
           }
           lastRead = readAt;
 
-          if (chain == null && !policy.Idle && provider.BufferedFrames >= provider.PrebufferFrames) {
+          // Cold start: no fixed measurement pause. Keep measuring while prebuffering and
+          // open as soon as the path is characterised (three active reads, or 150 ms of
+          // program observed, hard-capped at 400 ms) AND the buffer has reached the target
+          // that measurement produced. Never open into a squelched stream.
+          if (chain == null && !policy.Idle && policy.ObservationSatisfied(readTicks) &&
+              provider.BufferedFrames >= provider.PrebufferFrames) {
             deviceChanged = false;
             chain = OpenDefault(provider); // open AFTER prebuffer so first buffers are real audio
             outputGeneration++;
@@ -1018,18 +1141,24 @@ namespace AudioBridge {
       var splitProvider = new AdaptivePlayout();
       var assembler = new FrameAssembler(8);
       byte[] oneFrame = new byte[] { 0xd0, 0x07, 0x30, 0xf8 }; // +2000, -2000
-      assembler.Push(oneFrame, 1, 1.0f, splitProvider, true);
+      assembler.Assemble(oneFrame, 1, 1.0f); assembler.Flush(splitProvider);
       byte[] remainder = new byte[] { 0x07, 0x30, 0xf8 };
-      assembler.Push(remainder, remainder.Length, 1.0f, splitProvider, true);
+      assembler.Assemble(remainder, remainder.Length, 1.0f); assembler.Flush(splitProvider);
       if (assembler.TailBytes != 0 || splitProvider.BufferedFrames != 1)
         throw new Exception("frame assembler failed split-frame carry");
 
-      // A withheld push still consumes its bytes and keeps frame alignment.
+      // A withheld block still consumes its bytes and keeps frame alignment.
       var idleProvider = new AdaptivePlayout();
       var idleAssembler = new FrameAssembler(8);
-      idleAssembler.Push(oneFrame, oneFrame.Length, 1.0f, idleProvider, false);
+      idleAssembler.Assemble(oneFrame, oneFrame.Length, 1.0f);   // no Flush: squelched
       if (idleAssembler.TailBytes != 0 || idleProvider.BufferedFrames != 0)
-        throw new Exception("withheld push must consume bytes without inserting");
+        throw new Exception("a withheld block must consume bytes without inserting");
+      // ...and the NEXT block, once program resumes, must still reach the ring. Deciding
+      // insertion from the previous idle state dropped exactly this block.
+      idleAssembler.Assemble(oneFrame, oneFrame.Length, 1.0f);
+      idleAssembler.Flush(idleProvider);
+      if (idleProvider.BufferedFrames != 1)
+        throw new Exception("the first block after squelch must not be discarded");
 
       byte[] gained = new byte[] { 0xd0, 0x07, 0x30, 0xf8 };
       ApplyGain(gained, gained.Length, 0.5f);
@@ -1040,11 +1169,11 @@ namespace AudioBridge {
       // Peak observation drives squelch detection, so it must see program content.
       var peakAssembler = new FrameAssembler(8);
       var peakSink = new AdaptivePlayout();
-      peakAssembler.Push(oneFrame, oneFrame.Length, 1.0f, peakSink, true);
+      peakAssembler.Assemble(oneFrame, oneFrame.Length, 1.0f); peakAssembler.Flush(peakSink);
       if (peakAssembler.LastPeak != 2000) throw new Exception("peak observation failed");
       byte[] quiet = new byte[] { 0x01, 0x00, 0x00, 0x00 };
-      peakAssembler.Push(quiet, quiet.Length, 1.0f, peakSink, true);
-      if (peakAssembler.LastPeak > 8) throw new Exception("silent block must read as silent");
+      peakAssembler.Assemble(quiet, quiet.Length, 1.0f); peakAssembler.Flush(peakSink);
+      if (peakAssembler.LastPeak > 16) throw new Exception("silent block must read as silent");
 
       // Steady-state fidelity: after the opening fade, reconstruction is exact.
       var provider = Primed(Audio.Frames(300));
@@ -1112,6 +1241,45 @@ namespace AudioBridge {
         throw new Exception("squelch must not inflate the target");
       pol.OnRead(t0 + (long)(14 * perSec), 9600, 3000, 1.0);
       if (pol.Idle) throw new Exception("program audio must exit idle");
+
+      // Wired proxy: a steady low-jitter feed must not be charged a jitter tax. One 21 ms
+      // sender block every 21 ms is what a clean Ethernet path looks like from here.
+      var clean = new ArrivalPolicy();
+      long c0 = Stopwatch.GetTimestamp();
+      for (int i = 0; i < 200; i++) {
+        long t = c0 + (long)(i * 0.021 * perSec);
+        clean.OnRead(t, 4032, 3000, 1.0);
+        clean.Recompute(t, Audio.Frames(10), false);
+      }
+      if (clean.PrebufferMs > Audio.MinPrebufferMs)
+        throw new Exception("a clean link must stay at the floor, not inherit a bursty path's target");
+
+      // A silent gap must hand back latency the measurement no longer justifies, at once.
+      // Crawling down at 5 ms per 10 s through a gap where nothing is playing kept ~200 ms
+      // of dead latency in the field.
+      var drop = new ArrivalPolicy();
+      long d0 = Stopwatch.GetTimestamp(), tt = d0;
+      for (int i = 0; i < 150; i++) {                    // bursty: 100 ms deliveries
+        tt = d0 + (long)(i * 0.100 * perSec);
+        drop.OnRead(tt, 19200, 3000, 1.0);
+        drop.Recompute(tt, Audio.Frames(10), false);
+      }
+      drop.AdoptArmed(Audio.Frames(Audio.MaxPrebufferMs), true);
+      int raised = drop.PrebufferMs;
+      if (raised <= Audio.MinPrebufferMs) throw new Exception("a bursty path must raise the target");
+      long baseT = tt;
+      for (int i = 1; i <= 2000; i++) {                  // 42 s clean: flushes the 30 s window,
+        tt = baseT + (long)(i * 0.021 * perSec);         // but is short of the 60 s lowering hold
+        drop.OnRead(tt, 4032, 3000, 1.0);
+        drop.Recompute(tt, Audio.Frames(10), false);
+      }
+      if (drop.PrebufferMs != raised)
+        throw new Exception("the slow lowering hold must not have fired yet - test would prove nothing");
+      for (int i = 1; i <= 4; i++) drop.OnRead(tt + (long)(i * 2.0 * perSec), 4032, 0, 1.0);
+      if (!drop.Idle) throw new Exception("keepalives must enter idle");
+      drop.ApplyIdleTarget(Audio.Frames(10));
+      if (drop.PrebufferMs >= raised)
+        throw new Exception("an idle gap must return the latency the measurement no longer justifies");
 
       // Freshness trim bounds latency without the old occupancy-only reset.
       var trim = new AdaptivePlayout();
