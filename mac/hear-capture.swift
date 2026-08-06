@@ -69,7 +69,12 @@ var pendingHighWater = 0
 var dropEvents: UInt64 = 0
 var dropBytes: UInt64 = 0
 var maxDropAgeMs = 0.0
-var inFlightAgeMs = 0.0
+// Audio handed to writeAll but not yet written: it has left sendPending and is not
+// on the wire. Published before the blocking write so a stalled write is visible
+// while it stalls, instead of only being counted after it finally returns.
+var inflightBytes = 0
+var inflightSince = 0.0
+var senderGeneration: UInt64 = 0
 var writeCalls: UInt64 = 0
 var writeBytes: UInt64 = 0
 var maxWriteMs = 0.0
@@ -86,7 +91,7 @@ var dropEventWrite = 0
 var dropEventLost: UInt64 = 0
 
 // Callback metrics are recorded under the existing short queue lock. Formatting
-// and log I/O remain on the sender thread, never on the AudioQueue callback.
+// and log I/O stay on the sender and telemetry threads, never on the AudioQueue callback.
 func recordCaptureCallback(_ len: Int, _ now: Double) {
     sendCond.lock()
     captureFrames += UInt64(len / 4)
@@ -127,8 +132,9 @@ func enqueueSend(_ p: UnsafeRawPointer, _ len: Int, _ now: Double) {
     sendCond.unlock()
 }
 
-// Drain the fixed numeric event ring on the sender thread. The callback only
-// stores numbers in preallocated slots; formatting and logging happen here.
+// Drain the fixed numeric event ring off the callback. The callback only stores
+// numbers in preallocated slots; formatting and logging happen here. Safe from both
+// the sender and telemetry threads: the read index only advances under the lock.
 func emitDropEvents() {
     while true {
         sendCond.lock()
@@ -161,7 +167,10 @@ func emitSenderTelemetry() {
     let captureFramesNow = captureFrames
     let callbackGapNow = maxCallbackGapMs
     let pendingHighWaterNow = pendingHighWater
-    let inFlightAgeNow = inFlightAgeMs
+    let inflight = inflightBytes
+    // Aged live: a write that has been blocked 250 ms must read as 250 ms now, not
+    // as 0 until it returns. This is what made blocked writes invisible in the log.
+    let inflightAgeNow = inflight > 0 && inflightSince > 0 ? (now - inflightSince) * 1000 : 0
     let dropEventsNow = dropEvents
     let dropBytesNow = dropBytes
     let maxDropAgeNow = maxDropAgeMs
@@ -178,49 +187,52 @@ func emitSenderTelemetry() {
     sendCond.unlock()
     // String construction and log I/O happen after releasing the queue lock, so
     // the AudioQueue callback cannot wait behind either operation.
-    let line = String(format: "event=sender_metrics capture_frames=%llu callback_max_gap_ms=%.1f pending_bytes=%d pending_ms=%.1f pending_high_water=%d oldest_ms=%.1f inflight_age_ms=%.1f drop_events=%llu drop_bytes=%llu max_drop_age_ms=%.1f write_calls=%llu write_bytes=%llu max_write_ms=%.1f writes_over_20ms=%llu writes_over_100ms=%llu writes_over_250ms=%llu effective_sndbuf=%d",
+    // pending_bytes keeps its meaning (queued, not yet handed to writeAll); unsent_bytes
+    // is the backlog that actually matters to a listener: queued plus in flight.
+    let line = String(format: "event=sender_metrics capture_frames=%llu callback_max_gap_ms=%.1f pending_bytes=%d pending_ms=%.1f pending_high_water=%d oldest_ms=%.1f inflight_bytes=%d inflight_age_ms=%.1f unsent_bytes=%d drop_events=%llu drop_bytes=%llu max_drop_age_ms=%.1f write_calls=%llu write_bytes=%llu max_write_ms=%.1f writes_over_20ms=%llu writes_over_100ms=%llu writes_over_250ms=%llu effective_sndbuf=%d",
         captureFramesNow, callbackGapNow, pending, Double(pending) / 192.0, pendingHighWaterNow, oldestMs,
-        inFlightAgeNow, dropEventsNow, dropBytesNow, maxDropAgeNow, writeCallsNow, writeBytesNow, maxWriteNow,
+        inflight, inflightAgeNow, pending + inflight, dropEventsNow, dropBytesNow, maxDropAgeNow, writeCallsNow, writeBytesNow, maxWriteNow,
         writesOver20Now, writesOver100Now, writesOver250Now, effectiveSendBufferNow)
     FileHandle.standardError.write((line + "\n").data(using: .utf8)!)
 }
 
 // startSender drains the queue to fd on its own thread; on write failure it marks
-// the link dead and stops the main run loop so we tear down and re-accept.
+// the link dead and stops the main run loop so we tear down and re-accept. A second
+// thread emits telemetry, because a sender blocked in writeAll cannot report that it
+// is blocked: metrics used to stop entirely for the duration of the stall, which read
+// as a clean sender.
 func startSender(_ fd: Int32) {
+    sendCond.lock()
+    senderGeneration &+= 1
+    let generation = senderGeneration
+    sendCond.unlock()
     Thread.detachNewThread {
-        var lastTelemetry = CFAbsoluteTimeGetCurrent()
         while true {
             sendCond.lock()
             while sendPending.isEmpty && !senderDead {
                 _ = sendCond.wait(until: Date(timeIntervalSinceNow: 1.0))
-                if CFAbsoluteTimeGetCurrent() - lastTelemetry >= 1.0 { break }
             }
             if senderDead { sendCond.unlock(); return }
-            if sendPending.isEmpty {
-                sendCond.unlock()
-                emitDropEvents()
-                emitSenderTelemetry()
-                lastTelemetry = CFAbsoluteTimeGetCurrent()
-                continue
-            }
-            let now = CFAbsoluteTimeGetCurrent()
-            inFlightAgeMs = pendingSince > 0 ? (now - pendingSince) * 1000 : 0
             let chunk = sendPending
             sendPending.removeAll(keepingCapacity: true)
             pendingSince = 0
-            sendCond.unlock()
+            // Hand-off and in-flight publication are one critical section: this audio must
+            // never be absent from both counters, or a stall looks like an idle link.
             let writeStart = CFAbsoluteTimeGetCurrent()
+            inflightBytes = chunk.count
+            inflightSince = writeStart
+            sendCond.unlock()
             let ok = chunk.withUnsafeBytes { writeAll(fd, $0.baseAddress!, chunk.count) }
             let writeMs = (CFAbsoluteTimeGetCurrent() - writeStart) * 1000
             sendCond.lock()
+            inflightBytes = 0
+            inflightSince = 0
             writeCalls += 1
             writeBytes += UInt64(chunk.count)
             if writeMs > maxWriteMs { maxWriteMs = writeMs }
             if writeMs > 20 { writesOver20 += 1 }
             if writeMs > 100 { writesOver100 += 1 }
             if writeMs > 250 { writesOver250 += 1 }
-            inFlightAgeMs = 0
             sendCond.unlock()
             if writeMs > 20 {
                 FileHandle.standardError.write(String(format: "event=sender_slow_write bytes=%d duration_ms=%.1f\n", chunk.count, writeMs).data(using: .utf8)!)
@@ -231,10 +243,21 @@ func startSender(_ fd: Int32) {
                 CFRunLoopStop(mainLoop)
                 return
             }
-            if CFAbsoluteTimeGetCurrent() - lastTelemetry >= 1.0 {
-                emitSenderTelemetry()
-                lastTelemetry = CFAbsoluteTimeGetCurrent()
-            }
+        }
+    }
+    // Telemetry clock. It sleeps rather than waiting on sendCond: a second waiter there
+    // could swallow the signal() meant for the sender and delay real audio. The
+    // generation check retires this thread when the connection ends — a reconnect inside
+    // one tick would otherwise leave two threads emitting the same metrics.
+    Thread.detachNewThread {
+        while true {
+            Thread.sleep(forTimeInterval: 1.0)
+            sendCond.lock()
+            let retired = senderDead || senderGeneration != generation
+            sendCond.unlock()
+            if retired { return }
+            emitDropEvents()
+            emitSenderTelemetry()
         }
     }
 }
@@ -310,6 +333,8 @@ while true {
     sendCond.lock()
     sendPending.removeAll()
     pendingSince = 0
+    inflightBytes = 0     // a previous connection's stalled write must not be reported against this one
+    inflightSince = 0
     senderDead = false
     effectiveSendBuffer = Int(effective)
     dropEventRead = 0

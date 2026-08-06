@@ -51,7 +51,7 @@ type Config struct {
 	SndBufKB  int    `json:"sndBufKB"`
 	CaptureMs int    `json:"captureMs"`
 	RecvBufKB int    `json:"recvBufKB"` // legacy config field; retained for compatible config reads
-	PlayoutMs int    `json:"playoutMs"` // legacy config field; adaptive Windows playout owns its 140 ms target
+	PlayoutMs int    `json:"playoutMs"` // legacy config field; the Windows receiver measures its own target
 	VolumePct int    `json:"volumePct"` // playback gain on THIS device, 0-100 (100 = unity)
 	// PeerTimeoutMs is how long a leg waits for bytes before declaring the link dead
 	// and letting the supervisor relaunch it. Too low and a leg with no peer connected

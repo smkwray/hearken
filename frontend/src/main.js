@@ -48,7 +48,6 @@ app.innerHTML = `
 
     <div class="section">
       <div class="sec-h">Connection <span class="hint">playout adapts automatically</span></div>
-      <div class="slider disabled" title="The listener holds a 140 ms target and corrects clock drift automatically"><span class="lbl">Playout</span><span class="val">Automatic · 140 ms</span></div>
       <label class="slider" title="Chunk size the source captures"><span class="lbl">Capture</span><input type="range" id="cap" min="3" max="30" step="1"><span class="val" id="cap-v"></span></label>
       <label class="slider" title="TCP send socket buffer (advanced)"><span class="lbl">Send buffer</span><input type="range" id="snd" min="4" max="128" step="4"><span class="val" id="snd-v"></span></label>
       <label class="slider" title="How long a leg waits for audio before deciding the link is dead and relaunching. Too low and a leg with no peer connected restarts forever, which loads the audio system."><span class="lbl">Peer timeout</span><input type="range" id="peert" min="2000" max="60000" step="1000"><span class="val" id="peert-v"></span></label>
@@ -130,7 +129,7 @@ async function refresh() {
   document.querySelectorAll('#role button').forEach((b) => b.classList.toggle('active', b.dataset.role === (s.roleMode || '')));
   $('rolebadge').textContent = s.role ? ' · ' + s.role : '';
 
-  // Playout is automatic. Send/Capture and peer timeout are source-side policy.
+  // Send/Capture and peer timeout are source-side policy.
   $('snd').disabled = isWin; $('cap').disabled = isWin;
   $('peert').disabled = isWin;
   $('snd').closest('.slider').classList.toggle('disabled', isWin);
@@ -179,7 +178,8 @@ document.querySelectorAll('#dir button').forEach((b) => b.addEventListener('clic
 document.querySelectorAll('#role button').forEach((b) => b.addEventListener('click', async () => { msg('switching mode…'); msg(await SetRole(b.dataset.role)); setTimeout(refresh, 700); }));
 $('verify').addEventListener('click', async () => { msg('verifying…'); msg(await Verify()); });
 $('mark').addEventListener('click', async () => { msg(await MarkGlitch()); });
-$('apply').addEventListener('click', async () => { msg('applying…'); const r = await ApplyParams(parseInt($('snd').value), parseInt($('cap').value), 16, 140, parseInt($('peert').value)); touched = false; msg(r); setTimeout(refresh, 800); });
+// 4th arg is the legacy playoutMs field — 0 leaves it untouched; the receiver derives its own target.
+$('apply').addEventListener('click', async () => { msg('applying…'); const r = await ApplyParams(parseInt($('snd').value), parseInt($('cap').value), 16, 0, parseInt($('peert').value)); touched = false; msg(r); setTimeout(refresh, 800); });
 $('autostart').addEventListener('change', async () => { await SetAutoStart($('autostart').checked); });
 $('vol').addEventListener('input', () => { $('vol-v').textContent = $('vol').value + '%'; });
 $('vol').addEventListener('change', async () => { msg('volume ' + $('vol').value + '%…'); msg(await SetVolume(parseInt($('vol').value))); setTimeout(refresh, 700); });

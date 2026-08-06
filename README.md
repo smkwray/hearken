@@ -14,8 +14,9 @@ processes: launch it and it just runs.
 - **Follows the default output device** on Windows (e.g. Bluetooth headphones reconnecting).
 - **Auto-discovers** hearken hosts on your Tailscale **and LAN**, or type / read off an IP.
 - **Runs headless in the menubar/tray** (≈25 MB, no browser engine resident); a config window
-  opens on demand and frees its WebView on close. Windows playout automatically targets 140 ms
-  and corrects small clock drift without destructive buffer trims.
+  opens on demand and frees its WebView on close. Windows playout **measures the link and sizes
+  its own buffer** — a few tens of milliseconds on wired Ethernet, more on a bursty Wi-Fi path —
+  and corrects small clock drift without destructive buffer trims. There is nothing to tune.
 
 ## How it runs
 
