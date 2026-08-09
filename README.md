@@ -4,6 +4,14 @@
   <p>Low-latency system-audio bridge between two computers over Tailscale or plain LAN.</p>
 </div>
 
+> **Status: experimental. Qualification incomplete.** The transport carries no sequence numbers or
+> media timestamps, so once the receiver has confirmed the source is silent it cannot tell "still
+> silent" from "resumed, but the bytes are delayed" — a delayed talkspurt is heard late when those
+> bytes arrive. The wired Mac→Windows field evidence is an 11-cycle session, not the 100-cycle
+> court in the acceptance plan, and it recorded two active-content rebuffer events totalling
+> 100 ms. Continuous-content operation, Bluetooth, forced fragmentation and callback-boundary
+> races under load are all unqualified. See *Limitations* below.
+
 Play audio on one machine, hear it on another — in real time, in either or both directions.
 A tiny native app (Go + WebView via [Wails](https://wails.io)) owns the capture/playback
 processes: launch it and it just runs.
@@ -16,7 +24,9 @@ processes: launch it and it just runs.
 - **Runs headless in the menubar/tray** (≈25 MB, no browser engine resident); a config window
   opens on demand and frees its WebView on close. Windows playout **measures the link and sizes
   its own buffer** — a few tens of milliseconds on wired Ethernet, more on a bursty Wi-Fi path —
-  and corrects small clock drift without destructive buffer trims. There is nothing to tune.
+  and corrects small clock drift continuously. A genuinely stale backlog — a blocked sender write,
+  a stalled link that then dumps — is trimmed explicitly and counted, rather than silently. There
+  is nothing to tune.
 
 ## How it runs
 
@@ -63,7 +73,8 @@ hearken just streams raw PCM (s16le / 48 kHz / stereo) over TCP to whatever IP y
 
 ## Dependencies & licenses
 
-hearken does **not** bundle these — the installer pulls them, so there's no license entanglement:
+The macOS dependencies are installed, not bundled. **`NAudio.dll` (MIT) is the exception: it is
+vendored in this repo and ships inside the Windows release archive**, so its notice travels with it.
 
 | Dependency | Used for | License |
 |---|---|---|
@@ -90,14 +101,33 @@ Working: **Mac host ⇄ Windows client** (both directions). Scaffolded but not y
 
 ## Build from source
 
-Needs Go 1.21+, Node, and [Wails v2](https://wails.io/docs/gettingstarted/installation).
+Needs Go 1.23+ (`go.mod` pins 1.23.0), Node, and [Wails v2](https://wails.io/docs/gettingstarted/installation) v2.12.0.
 ```bash
 # macOS — build + sign so the mic grant persists across rebuilds:
 bash scripts/make-signing-cert.sh   # once
 bash scripts/build-mac.sh
-# Windows:
+# Windows — hearken.exe AND the two audio helpers:
 wails build
+$csc = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+& $csc /nologo /target:exe /out:lib\capture.exe /r:windows\lib\NAudio.dll windows\lib\capture.cs
+& $csc /nologo /target:exe /out:lib\play.exe    /r:windows\lib\NAudio.dll windows\lib\play.cs windows\lib\SquelchProfile.cs
 ```
+
+`windows\lib\SquelchProfile.cs` and `mac/SquelchProfile.swift` are generated from
+`profile/squelch.profile` by `scripts/gen-squelch-profile.py`; `scripts/hygiene_check.sh` fails if
+they drift. Both ends must run the same profile hash — they log it on every connection.
+
+## Limitations
+
+- **No authentication or encryption.** hearken streams raw PCM over a plain TCP socket and the
+  host listens on all interfaces. Anyone who can reach the port can connect and hear the audio, or
+  send audio to it. Run it only across a network path and firewall policy you trust; Tailscale
+  provides the transport security here, the application provides none.
+- **Delayed resumption is heard late.** See the status note at the top.
+- **macOS release builds are unsigned and un-notarized** — right-click → Open the first time. The
+  local self-signing script only exists so the microphone grant survives a rebuild on a dev machine.
+- **Qualification is incomplete**, as described at the top. Bluetooth endpoints in particular add
+  their own codec and radio buffering that no counter here can see.
 
 ## License
 

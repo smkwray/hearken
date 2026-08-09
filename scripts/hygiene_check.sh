@@ -73,7 +73,8 @@ required_sites=(
   "exchange.TakeMeasurement"                  # telemetry -> network handoff
   "exchange.PublishMeasurement"               # the other half of it
   "policy.ObservationSatisfied(readTicks)"    # the cold-open gate
-  "OnConfirmedEntry"                          # confirmed-entry branch reachable from ProcessRead
+  "OnConfirmedEntry(c.Provider"                # the confirmed-entry branch, CALLED from ProcessRead
+  "ForceTargetBeforeColdOpen(provider"        # forced adoption before the first open
 )
 for site in "${required_sites[@]}"; do
   if ! grep -qF "$site" windows/lib/play.cs; then

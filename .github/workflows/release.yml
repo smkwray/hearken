@@ -1,5 +1,5 @@
 # Build hearken for macOS + Windows and attach the artifacts to a GitHub Release.
-# Triggers on a version tag (e.g. v0.1.0). DRAFT — not yet validated on CI.
+# Triggers on a version tag (e.g. v0.1.0). Has run green for v0.1.1 and v0.2.0.
 #
 # macOS distribution note: this produces an UNSIGNED/ad-hoc .app, so users must
 # right-click -> Open the first time (Gatekeeper). For a clean release, add an Apple
@@ -21,10 +21,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
-        with: { go-version: '1.21' }
+        with: { go-version: '1.23' }
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
-      - run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+      - run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
       - run: wails build -platform darwin/universal
       - name: Package .app (zip + drag-to-Applications dmg)
         run: |
@@ -39,10 +39,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
-        with: { go-version: '1.21' }
+        with: { go-version: '1.23' }
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
-      - run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+      - run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
       - run: wails build -platform windows/amd64
       - name: Compile audio helpers (capture.exe / play.exe)
         shell: pwsh

@@ -436,10 +436,12 @@ namespace AudioBridge {
           lowerCount++;
           targetReason = "lower_idle";
         }
-        // A raise armed before the gap describes a condition that no longer holds.
+        // A raise armed before the gap may describe a condition that no longer holds at its old
+        // magnitude while still warranting a raise. Discarding it outright lost the part the
+        // evidence still supports, and the next talkspurt resumed at the floor.
         if (armedPrebufferMs > 0 && armedPrebufferMs > want) {
-          armedPrebufferMs = 0;
           armedExpiredCount++;
+          armedPrebufferMs = want > prebufferMs ? want : 0;
         }
         reserveMs = Math.Max(Audio.MinReserveMs, prebufferMs - quantumMs);
         stableSinceTicks = 0;
@@ -632,6 +634,22 @@ namespace AudioBridge {
 
       // PublishTarget hands the render callback a new operating point. The callback
       // adopts it at its next block boundary; policy is never computed inside it.
+      // AdoptTargetNow applies a target immediately instead of leaving it for the render
+      // callback's ordinary rule, which refuses a raise until occupancy already covers it. Before
+      // the first open there is no callback to adopt anything, and at a hard rebuffer we are
+      // already paying the interruption -- both are safe boundaries, and both previously let the
+      // provider keep an undersized target the policy had deliberately raised.
+      public void AdoptTargetNow(int prebufferMsValue) {
+        lock (gate) {
+          pendingPrebufferFrames = Audio.Frames(prebufferMsValue);
+          if (pendingPrebufferFrames != prebufferFrames) {
+            prebufferFrames = pendingPrebufferFrames;
+            targetGeneration++;
+            integralMsSeconds = 0;
+          }
+        }
+      }
+
       public void PublishTarget(int prebufferMsValue) {
         int want = Audio.Frames(prebufferMsValue);
         lock (gate) {
@@ -750,9 +768,10 @@ namespace AudioBridge {
         }
       }
 
-      // TakeRequestQuantum returns the p99 render request over the recent window and
-      // the underrun count since the previous call. Telemetry thread only: it sorts,
-      // so it must never run in the callback.
+      // TakeRequestQuantum returns the p99 render request over the recent window and the
+      // underrun count since the previous call. Called from the telemetry thread, which then
+      // hands the numbers to the network thread through PolicyExchange -- policy itself is only
+      // ever mutated there. It sorts, so it must never run in the render callback.
       public int TakeRequestQuantum(out bool underrunSinceLast) {
         lock (gate) {
           underrunSinceLast = underrunsSinceRecompute > 0;
@@ -1039,6 +1058,16 @@ namespace AudioBridge {
           // RESUME_PREBUFFER: the talkspurt boundary has been crossed; withhold until a full
           // target of post-boundary audio exists, then fade in ONCE. Zero-fill here is
           // intentional and must never be charged as starvation.
+          if (mode == RenderMode.ResumePrebuffer) {
+            // If the idle boundary that closes this talkspurt is already queued, the segment is
+            // complete: no more audio is coming for it. Waiting for a resume target it can never
+            // reach traps the phrase until later program drags occupancy over the line, and it
+            // then plays stale. This is the ordering where both markers were queued before the
+            // callback ran, so MarkIdleStart saw IdleSilence and could not select drain.
+            if (markerCount > 0 && markers[markerHead].Kind == MarkerKind.IdleStart) {
+              mode = RenderMode.DrainToIdle;
+            }
+          }
           if (mode == RenderMode.ResumePrebuffer) {
             long since = writeSerial - resumeAnchorSerial;
             if (since < prebufferFrames || frames < needed) {
@@ -1534,27 +1563,40 @@ namespace AudioBridge {
       public string TakeDescription() { lock (gate) { return description; } }
     }
 
-    // OnConfirmedEntry is the whole decision taken when the source is confirmed silent, factored
-    // out so the branch itself is under test rather than only the two methods it calls.
+    // OnConfirmedEntry is the whole decision taken when the source is confirmed silent. It is
+    // CALLED FROM ProcessRead, so the tests and production exercise the same branch.
     //
     // With the output open the boundary goes into the audio and playback drains to it. With the
     // output never opened there is no listener to drain to, so buffered pre-silence audio is
     // merely stale: keeping it would play a fragment of an old phrase after the next talkspurt,
     // a silence of arbitrary length later. The observation is forgotten with it, or the next
     // talkspurt would open on evidence gathered before that silence.
-    static void OnConfirmedEntry(AdaptivePlayout provider, ArrivalPolicy policy,
+    // Returns true when the caller must DISCARD everything queued before this boundary. With the
+    // output closed there is no listener to drain to, so pre-silence audio is stale -- and it must
+    // be dropped at the boundary, in stream order, not after the batch commits. Clearing the whole
+    // provider afterwards also erased any RESUMED audio that arrived later in the same read.
+    static bool OnConfirmedEntry(AdaptivePlayout provider, ArrivalPolicy policy,
                                  bool outputOpen, long transitionId) {
       if (outputOpen) {
         provider.MarkIdleStart(transitionId);
-      } else {
-        provider.ClearForColdStart();
-        policy.ResetColdObservation();
+        return false;
       }
+      provider.ClearForColdStart();
+      policy.ResetColdObservation();
+      return true;
     }
 
     // A read carries media only once it completes a whole stereo frame. A 1-3 byte read reaching
     // the policy moved the arrival clock, opened epochs, consumed a telemetry measurement and took
     // part in the cold-open decision -- making all of it depend on how TCP chopped the stream.
+    // Before the first output open there is no render callback to adopt a published target, so the
+    // endpoint would open against whatever was last adopted -- typically the floor -- however high
+    // a target the measurement had already warranted. Factored out so the decision is under test.
+    static void ForceTargetBeforeColdOpen(AdaptivePlayout provider, ArrivalPolicy policy) {
+      policy.AdoptArmed(provider.BufferedFrames, true);
+      provider.AdoptTargetNow(policy.PrebufferMs);
+    }
+
     static bool ReadCarriesMedia(int completeBytes) { return completeBytes >= SquelchProfile.FrameBytes; }
 
     // Everything a read does to state, in one place. RunPlay calls this and so does the self-test,
@@ -1588,7 +1630,6 @@ namespace AudioBridge {
 
       int spanCount = c.Classifier.Scan(c.Assembler.Buffer_, 0, complete, c.Spans);
       int opCount = 0;
-      bool coldClear = false;
       for (int si = 0; si < spanCount; si++) {
         int frames = c.Spans[si].Bytes / SquelchProfile.FrameBytes;
         // Resume happens BEFORE its own frames are handled: the talkspurt's first frame must not
@@ -1610,15 +1651,17 @@ namespace AudioBridge {
         if (c.Spans[si].Edge == SourceEdge.Confirmed) {
           c.Policy.SuspendDebt(readTicks);
           c.Policy.ApplyIdleTarget(c.Provider.RequestQuantumFrames);
+          // Applied HERE, in stream order. Doing it after the commit discarded resumed audio that
+          // arrived later in the same read -- confirmation and resumption can both occur in one.
+          if (OnConfirmedEntry(c.Provider, c.Policy, c.OutputOpen, c.TransitionId + 1)) {
+            opCount = 0;                 // pre-boundary audio is stale with no output to drain to
+          } else {
+            c.TransitionId++;
+          }
           c.Ops[opCount].Kind = OpKind.AdoptTarget; c.Ops[opCount].TargetMs = c.Policy.PrebufferMs; opCount++;
-          if (c.OutputOpen) {
-            c.Ops[opCount].Kind = OpKind.IdleStart; c.Ops[opCount].TransitionId = ++c.TransitionId; opCount++;
-          } else coldClear = true;
         }
       }
       c.Provider.Commit(c.Assembler.Buffer_, c.Ops, opCount, ++c.BatchId);
-      // With the output closed nothing is rendering, so this needs no atomicity.
-      if (coldClear) { c.Provider.ClearForColdStart(); c.Policy.ResetColdObservation(); }
       if (!c.Classifier.Confirmed && spanCount > 0) {
         if (c.Policy.AdoptArmed(c.Provider.BufferedFrames, false))
           c.Provider.PublishTarget(c.Policy.PrebufferMs);
@@ -1705,7 +1748,7 @@ namespace AudioBridge {
           long hardNow = provider.HardRebufferCount;
           if (hardNow != lastHardRebuffer) {
             lastHardRebuffer = hardNow;
-            if (policy.AdoptArmed(provider.BufferedFrames, true)) provider.PublishTarget(policy.PrebufferMs);
+            if (policy.AdoptArmed(provider.BufferedFrames, true)) provider.AdoptTargetNow(policy.PrebufferMs);
           }
 
           // Recompute runs HERE, on the thread that owns the policy, once per published
@@ -1728,6 +1771,10 @@ namespace AudioBridge {
           // open as soon as the path is characterised (three active reads, or 150 ms of
           // program observed, hard-capped at 400 ms) AND the buffer has reached the target
           // that measurement produced. Never open into a squelched stream.
+          // Force the warranted target in before the gate reads it. There is no render callback
+          // yet, so an ordinary publication would sit pending and the endpoint would open against
+          // whatever target happened to be adopted -- typically the 40 ms floor.
+          if (chain == null && !classifier.Confirmed) ForceTargetBeforeColdOpen(provider, policy);
           if (chain == null && !classifier.Confirmed && policy.ObservationSatisfied(readTicks) &&
               provider.BufferedFrames >= provider.PrebufferFrames) {
             reconcileRequested = false;
@@ -1882,7 +1929,7 @@ namespace AudioBridge {
     static readonly string[] ExpectedCases = new string[] {
       "exchange", "profile-mode", "R1", "R5", "R6", "R6b", "R10", "trim-attribution",
       "no-discard", "cadence", "cadence-teeth",
-      "A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "A9", "C1", "C2",
+      "A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "A9", "A10", "A11", "C1", "C2", "C3",
       "R2", "R3", "R4", "R7", "R9", "P1", "P2", "P3", "P4",
       "clean-feed", "forced-adopt", "freshness",
     };
@@ -1991,10 +2038,9 @@ namespace AudioBridge {
           throw new Exception("a trim during an output transition must be attributed to the transition");
       }
 
-      // R6b: the decision that keeps partial reads away from policy, extracted so the branch is
-      // under test rather than only its call site. NOTE: this does NOT establish full read-shape
-      // invariance -- that needs the production read processor extracted so the suite can drive
-      // the real thing instead of the DriveRead mirror. Recorded as an open condition.
+      // R6b: the decision that keeps partial reads away from policy. NOTE: this does not by itself
+      // establish full read-shape invariance -- for that, R5 would have to drive whole PCM through
+      // ProcessRead in every fragmentation shape rather than through the classifier alone.
       Case("R6b");
       {
         if (ReadCarriesMedia(0) || ReadCarriesMedia(1) || ReadCarriesMedia(2) || ReadCarriesMedia(3))
@@ -2261,6 +2307,78 @@ namespace AudioBridge {
             prov.BufferedFrames + " frames retained");
       }
 
+      // C3: confirmation AND resumption in one read while the output has never opened. The cold
+      // clear used to run after the batch committed, so it erased the resumed audio that arrived
+      // later in the same read. Driven through the production ProcessRead.
+      Case("C3");
+      {
+        var pol = new ArrivalPolicy(); var cls = new SourceClassifier();
+        var ctx = new ReadContext {
+          Provider = new AdaptivePlayout(), Policy = pol, Classifier = cls,
+          Assembler = new FrameAssembler(1 << 21), Spans = new SourceSpan[512],
+          Ops = new ProviderOp[2048], OutputOpen = false,
+        };
+        ctx.Provider.PublishTarget(Audio.MinPrebufferMs);
+        int resumed = 480;
+        byte[] both = BuildStream(0, SquelchProfile.ConfirmFrames, resumed);
+        ProcessRead(ctx, both, both.Length, Stopwatch.GetTimestamp(), false, 1.0);
+        if (!cls.Confirmed == false && cls.Confirmed)
+          throw new Exception("the stream resumes, so the classifier must end unconfirmed");
+        if (ctx.Provider.BufferedFrames < resumed)
+          throw new Exception("resumed audio in the same read as a cold confirmation must survive, " +
+            "buffered " + ctx.Provider.BufferedFrames + " of " + resumed);
+      }
+
+      // A10: both boundaries queued before any callback. MarkIdleStart then sees IdleSilence, not
+      // ResumePrebuffer, so it cannot select drain -- the completed short phrase would wait for a
+      // resume target that can never arrive and play stale much later.
+      Case("A10");
+      {
+        var prov = new AdaptivePlayout();
+        prov.PublishTarget(400);
+        byte[] outBuf = new byte[Audio.Frames(10) * 4];
+        prov.MarkIdleStart(1);
+        prov.Read(outBuf, 0, outBuf.Length);                 // now in IdleSilence
+        if (prov.RenderModeForTest != (int)RenderMode.IdleSilence)
+          throw new Exception("the fixture must reach idle silence first, else A10 proves nothing");
+        prov.MarkTalkspurt(2);                               // everything queued BEFORE the callback
+        int shortPhrase = Audio.Frames(50);
+        prov.AddFrames(MakeTone(shortPhrase), 0, shortPhrase * 4);
+        prov.MarkIdleStart(3);
+        long suppliedBeforeDrain = prov.SuppliedFramesForTest;
+        for (int i = 0; i < 20; i++) prov.Read(outBuf, 0, outBuf.Length);
+        if (prov.SuppliedFramesForTest <= suppliedBeforeDrain)
+          throw new Exception("a phrase already bounded by its closing boundary must be drained, not held");
+      }
+
+      // A11: a target adopted at a safe boundary takes effect immediately. Ordinary publication
+      // refuses a raise until occupancy covers it, and before the first open there is no callback
+      // to adopt anything -- so the endpoint opened against the floor.
+      Case("A11");
+      {
+        var prov = new AdaptivePlayout();
+        prov.PublishTarget(200);
+        if (prov.PrebufferFrames == Audio.Frames(200))
+          throw new Exception("ordinary publication must NOT adopt a raise here, else A11 is vacuous");
+        // Drive the production decision, not just its mechanism.
+        var armPol = new ArrivalPolicy(); var armCls = new SourceClassifier();
+        var armSp = new SourceSpan[64];
+        long at = Stopwatch.GetTimestamp();
+        byte[] armBurst = BuildStream(9600, 0, 0);
+        for (int i = 0; i < 60; i++) {
+          at += (long)(0.200 * perSec);
+          DriveRead(armPol, armCls, armSp, at, armBurst, 0, armBurst.Length);
+          armPol.Recompute(at, Audio.Frames(10), false);
+        }
+        var coldProv = new AdaptivePlayout();
+        if (coldProv.PrebufferFrames != Audio.Frames(Audio.MinPrebufferMs))
+          throw new Exception("a fresh provider must start at the floor, else A11 is vacuous");
+        ForceTargetBeforeColdOpen(coldProv, armPol);
+        if (coldProv.PrebufferFrames <= Audio.Frames(Audio.MinPrebufferMs))
+          throw new Exception("the warranted target must be in force before the cold open, got " +
+            coldProv.PrebufferFrames);
+      }
+
       Case("A4");
       {
         var prov = new AdaptivePlayout();
@@ -2415,9 +2533,10 @@ namespace AudioBridge {
           throw new Exception("qualifying media and the talkspurt must both be inserted, got " + inserted);
       }
 
+      // P3: an arm the evidence no longer supports at its old magnitude must be REDUCED to what
+      // is still warranted, not discarded. Discarding it lost the part the evidence supports and
+      // the next talkspurt resumed at the floor.
       Case("P3");
-      // P3: an arm that the evidence no longer supports expires at confirmation; one it still
-      // supports survives to be adopted at the talkspurt.
       {
         var pol = new ArrivalPolicy(); var cls = new SourceClassifier();
         var sp = new SourceSpan[64];
@@ -2428,12 +2547,27 @@ namespace AudioBridge {
           DriveRead(pol, cls, sp, t, bursty, 0, bursty.Length);
           pol.Recompute(t, Audio.Frames(10), false);
         }
-        int warranted = pol.WarrantedForTest(Audio.Frames(10));
-        if (warranted <= Audio.MinPrebufferMs)
-          throw new Exception("the P3 fixture must warrant a raise, else it proves nothing");
+        int armedHigh = pol.WarrantedForTest(Audio.Frames(10));
+        if (armedHigh <= Audio.MinPrebufferMs + HysteresisForTest)
+          throw new Exception("the P3 fixture must first arm a raise well above the floor");
+        // Now feed a moderately bursty stretch so the warranted value FALLS but stays above the
+        // floor. Without this the arm equals the warranted value and the reduce-or-discard branch
+        // never executes -- the check would pass however that branch behaves.
+        byte[] milder = BuildStream(2400, 0, 0);
+        for (int i = 0; i < 900; i++) {          // ~45 s, enough to flush the 30 s window
+          t += (long)(0.050 * perSec);
+          DriveRead(pol, cls, sp, t, milder, 0, milder.Length);
+          pol.Recompute(t, Audio.Frames(10), false);
+        }
+        int nowWarranted = pol.WarrantedForTest(Audio.Frames(10));
+        if (!(nowWarranted < armedHigh && nowWarranted > Audio.MinPrebufferMs))
+          throw new Exception("the P3 fixture must leave the arm ABOVE a still-raised warranted " +
+            "value: armed " + armedHigh + " warranted " + nowWarranted);
         pol.ApplyIdleTarget(Audio.Frames(10));
-        if (pol.PrebufferMs < Audio.MinPrebufferMs)
-          throw new Exception("a still-warranted target must not be discarded at confirmation");
+        if (!pol.AdoptArmed(1, true))
+          throw new Exception("a still-warranted arm must survive confirmation and be adoptable");
+        if (pol.PrebufferMs <= Audio.MinPrebufferMs)
+          throw new Exception("adopting the retained arm must raise above the floor, got " + pol.PrebufferMs);
       }
 
       // ---- arrival accounting, driven exactly as production drives it ------------------
