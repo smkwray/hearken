@@ -21,7 +21,10 @@ namespace AudioBridge {
   class Play : IMMNotificationClient {
     static readonly MMDeviceEnumerator en = new MMDeviceEnumerator();
     static Play notifier;                 // keep callback rooted (not GC'd)
-    static readonly WaveFormat SourceFmt = new WaveFormat(48000, 16, 2);
+    // From the generated profile, not hand-written: a profile change must move the actual PCM
+    // format with it, or classification and the ring would describe a stream we no longer receive.
+    static readonly WaveFormat SourceFmt =
+      new WaveFormat(SquelchProfile.SampleRate, 16, SquelchProfile.Channels);
     static float gGain = 1.0f;             // playback gain 0.0-1.0 (arg 3), applied to PCM
 
     // ---- output reconciliation --------------------------------------------
@@ -119,7 +122,12 @@ namespace AudioBridge {
             // live link is impossible -> a 5s read timeout means the link is gone.
             client.ReceiveTimeout = 5000;
             EnableKeepAlive(client.Client, 10000, 1000); // OS-level net, second line of defense
-            Console.Error.WriteLine("connected");
+            // Deployment evidence: raw v1 carries no version, so a mismatched peer cannot be
+            // detected at runtime. Both ends logging their profile is the only way to see it.
+            Console.Error.WriteLine("connected profile=" + SquelchProfile.Id + " hash=" +
+              SquelchProfile.Hash + " confirm_frames=" + SquelchProfile.ConfirmFrames +
+              " silence_peak=" + SquelchProfile.SilencePeak +
+              " forgiveness=" + (SourceClassifier.ContinuousPcmRequested() ? "off (continuous PCM)" : "on"));
             RunPlay(client.GetStream());
           }
         } catch (Exception e) {
@@ -145,8 +153,8 @@ namespace AudioBridge {
     // not tuning knobs: nothing here is user-visible, and the operating point between
     // them is measured, never configured.
     static class Audio {
-      public const int SampleRate = 48000;
-      public const int FrameBytes = 4;
+      public const int SampleRate = SquelchProfile.SampleRate;
+      public const int FrameBytes = SquelchProfile.FrameBytes;
       public const int CapacityFrames = SampleRate * 2;        // 2 s physical ring
       public const int FadeFrames = SampleRate * 8 / 1000;     // 8 ms fade / conceal budget
       public const int MinPrebufferMs = 40;
@@ -476,6 +484,19 @@ namespace AudioBridge {
       }
     }
 
+    // One ordered commit per assembled read. Target adoption, boundaries and PCM used to take
+    // the provider lock separately, so the render callback could observe a resumed state without
+    // the audio behind it, or a threshold frame with its boundary not yet installed -- turning an
+    // intentional source boundary into a counted underrun. A batch makes the whole tuple visible
+    // at once, and carries a batch id so a retried commit cannot append the same PCM twice.
+    enum OpKind { AdoptTarget, Pcm, IdleStart, Talkspurt }
+    struct ProviderOp {
+      public OpKind Kind;
+      public int Offset, Bytes;   // Pcm
+      public int TargetMs;        // AdoptTarget
+      public long TransitionId;   // boundaries
+    }
+
     // Where the source crossed, expressed as a position in the audio itself.
     enum RenderMode { ActivePlaying, DrainToIdle, IdleSilence, ResumePrebuffer }
     enum MarkerKind { IdleStart, TalkspurtStart }
@@ -522,7 +543,7 @@ namespace AudioBridge {
       const int MarkerCapacity = 32;
       readonly TimelineMarker[] markers = new TimelineMarker[MarkerCapacity];
       int markerHead, markerCount;
-      long lastTransitionId, markerOverflows, markersCrossedIdle, markersCrossedTalk;
+      long lastTransitionId, lastBatchId, markerOverflows, markersCrossedIdle, markersCrossedTalk;
       long idleSilenceFrames, resumeWaitFrames;
       RenderMode mode = RenderMode.ActivePlaying;
       double phase, ratio = 1.0, integralMsSeconds;
@@ -575,6 +596,11 @@ namespace AudioBridge {
           integralMsSeconds = 0;
         }
       }
+      // Test hook: the cross-boundary lookahead defect only shows when the resampling ratio is
+      // off unity, because at ratio 1.0 the interpolation fraction is always zero and no blending
+      // happens. Driving the controller to a fractional phase indirectly is not reproducible.
+      public void SetRatioForTest(double r) { lock (gate) { ratio = r; phase = 0.5; } }
+      public double PhaseForTest { get { lock (gate) { return phase; } } }
       public int RenderModeForTest { get { lock (gate) { return (int)mode; } } }
       public long IdleSilenceFrames { get { lock (gate) { return idleSilenceFrames; } } }
       public long ResumeWaitFrames { get { lock (gate) { return resumeWaitFrames; } } }
@@ -615,6 +641,39 @@ namespace AudioBridge {
         }
       }
 
+      // Commit applies an ordered batch under ONE acquisition of the provider lock. The render
+      // callback can therefore only ever see complete tuples. `batchId` is monotonic; replaying a
+      // batch is a no-op rather than a second copy of the PCM.
+      public bool Commit(byte[] pcm, ProviderOp[] ops, int count, long batchId) {
+        lock (gate) {
+          if (batchId <= lastBatchId) return false;
+          lastBatchId = batchId;
+          for (int i = 0; i < count; i++) {
+            switch (ops[i].Kind) {
+              case OpKind.AdoptTarget:
+                // Adopted AT a safe boundary, so it does not wait for the ordinary rule that
+                // refuses a higher target until occupancy already covers it. That rule would
+                // discard exactly the raise the resume boundary exists to apply.
+                pendingPrebufferFrames = Audio.Frames(ops[i].TargetMs);
+                prebufferFrames = pendingPrebufferFrames;
+                targetGeneration++;
+                integralMsSeconds = 0;
+                break;
+              case OpKind.Pcm:
+                AddFramesLocked(pcm, ops[i].Offset, ops[i].Bytes);
+                break;
+              case OpKind.IdleStart:
+                MarkIdleStartLocked(ops[i].TransitionId);
+                break;
+              case OpKind.Talkspurt:
+                MarkTalkspurtLocked(ops[i].TransitionId);
+                break;
+            }
+          }
+          return true;
+        }
+      }
+
       // MarkIdleStart / MarkTalkspurt place a boundary AT THE CURRENT WRITE POSITION, which is
       // the whole point: playback lags the network, so the sender can already have resumed while
       // WASAPI is still rendering audio from before the silence. A live Boolean would cut the
@@ -622,8 +681,9 @@ namespace AudioBridge {
       //
       // The transition id makes both idempotent: a repeated heartbeat, or a retried batch, must
       // not add a second boundary or duplicate a talkspurt.
-      public bool MarkIdleStart(long transitionId) {
-        lock (gate) {
+      public bool MarkIdleStart(long transitionId) { lock (gate) { return MarkIdleStartLocked(transitionId); } }
+      bool MarkIdleStartLocked(long transitionId) {
+        {
           if (transitionId <= lastTransitionId) return false;
           lastTransitionId = transitionId;
           if (!PushMarkerLocked(MarkerKind.IdleStart, writeSerial, transitionId)) return false;
@@ -632,6 +692,10 @@ namespace AudioBridge {
           // and render what is already here.
           integralMsSeconds = 0;
           softPending = false;
+          // Reset the control clock too. Leaving it meant the first active callback after a long
+          // silence computed its elapsed time across the whole quiet interval and multiplied the
+          // current error by it, biasing the correction for a pause that carried no information.
+          lastControlTicks = 0;
           // Also from ResumePrebuffer. A short talkspurt under a high target never accumulates
           // the target behind its boundary -- the source went quiet first -- so waiting there is
           // waiting for audio that will never come. The phrase would be held until some later
@@ -642,8 +706,9 @@ namespace AudioBridge {
           return true;
         }
       }
-      public bool MarkTalkspurt(long transitionId) {
-        lock (gate) {
+      public bool MarkTalkspurt(long transitionId) { lock (gate) { return MarkTalkspurtLocked(transitionId); } }
+      bool MarkTalkspurtLocked(long transitionId) {
+        {
           if (transitionId <= lastTransitionId) return false;
           lastTransitionId = transitionId;
           return PushMarkerLocked(MarkerKind.TalkspurtStart, writeSerial, transitionId);
@@ -652,10 +717,16 @@ namespace AudioBridge {
 
       bool PushMarkerLocked(MarkerKind kind, long serial, long id) {
         if (markerCount >= MarkerCapacity) {
-          // Never render ambiguously ordered PCM: collapse to the newest boundary instead.
+          // Never render ambiguously ordered PCM. Forgetting the markers alone left the old audio
+          // in the ring with render state that no longer described it; collapse the PCM to the
+          // newest boundary as well and fail fresh.
           markerOverflows++;
           markerHead = markerCount = 0;
-          mode = kind == MarkerKind.IdleStart ? RenderMode.DrainToIdle : RenderMode.ResumePrebuffer;
+          head = 0; frames = 0; phase = 0;
+          readSerial = writeSerial;
+          resumeAnchorSerial = writeSerial;
+          pendingDiscontinuity = true;
+          mode = kind == MarkerKind.IdleStart ? RenderMode.IdleSilence : RenderMode.ResumePrebuffer;
         }
         int at = (markerHead + markerCount) % MarkerCapacity;
         markers[at].Kind = kind; markers[at].Serial = serial; markers[at].TransitionId = id;
@@ -670,6 +741,10 @@ namespace AudioBridge {
           MarkerKind k = markers[markerHead].Kind;
           markerHead = (markerHead + 1) % MarkerCapacity;
           markerCount--;
+          // Phase must not carry across a source boundary. A retained fraction would start the
+          // resumed program partway through its first source frame -- the one frame the spec
+          // explicitly protects.
+          phase = 0;
           if (k == MarkerKind.IdleStart) { mode = RenderMode.IdleSilence; markersCrossedIdle++; }
           else { mode = RenderMode.ResumePrebuffer; resumeAnchorSerial = readSerial; markersCrossedTalk++; }
         }
@@ -720,9 +795,12 @@ namespace AudioBridge {
       }
 
       public void AddFrames(byte[] input, int offset, int count) {
+        lock (gate) { AddFramesLocked(input, offset, count); }
+      }
+      void AddFramesLocked(byte[] input, int offset, int count) {
         int add = count / FrameBytes;
         if (add <= 0) return;
-        lock (gate) {
+        {
           lastWriteBeforeFrames = frames;
           if (add > CapacityFrames) {
             int skip = add - CapacityFrames;
@@ -921,7 +999,10 @@ namespace AudioBridge {
           if (mode == RenderMode.DrainToIdle) {
             long toBoundary = markerCount > 0 ? markers[markerHead].Serial - readSerial : 0;
             if (toBoundary < 0) toBoundary = 0;
-            int drainable = (int)(toBoundary / (ratio > 0 ? ratio : 1.0));
+            // RenderFrames reads base+1 as interpolation lookahead, so leave one frame in hand:
+            // otherwise the last pre-boundary output frame blends in the first POST-boundary
+            // sample, leaking a fraction of resumed program before the silence.
+            int drainable = (int)((toBoundary - 1) / (ratio > 0 ? ratio : 1.0));
             if (drainable > outputFrames) drainable = outputFrames;
             if (drainable > 0 && frames > 1) {
               int byOccupancy = (int)((frames - 1) / (ratio > 0 ? ratio : 1.0));
@@ -1481,7 +1562,8 @@ namespace AudioBridge {
       var policy = new ArrivalPolicy();
       var classifier = new SourceClassifier();
       var spanBuf = new SourceSpan[256];
-      long sourceTransitionId = 0;
+      var ops = new ProviderOp[1024];        // <= 3 ops per span, preallocated
+      long sourceTransitionId = 0, providerBatchId = 0;
       OutputChain chain = null;
       byte[] tmp = new byte[SourceFmt.AverageBytesPerSecond / 20]; // ~50ms
       var assembler = new FrameAssembler(tmp.Length);
@@ -1554,7 +1636,12 @@ namespace AudioBridge {
           // read blocked -- never by what the returning bytes turn out to contain.
           policy.OnGap(readTicks, gapStartedConfirmed, provider.RatioSnapshot);
 
+          // Build ONE ordered batch for this read. Nothing reaches the provider until the whole
+          // tuple is ready, so the render callback cannot observe resumed state without its
+          // audio, or a threshold frame whose boundary has not been installed yet.
           int spanCount = classifier.Scan(assembler.Buffer_, 0, complete, spanBuf);
+          int opCount = 0;
+          bool coldClear = false;
           for (int si = 0; si < spanCount; si++) {
             int frames = spanBuf[si].Bytes / SquelchProfile.FrameBytes;
             // Resume happens BEFORE its own frames are handled: the talkspurt's first frame
@@ -1562,25 +1649,29 @@ namespace AudioBridge {
             if (spanBuf[si].Edge == SourceEdge.Resumed) {
               policy.ResumeDebt(readTicks);
               policy.AdoptArmed(provider.BufferedFrames, true);
-              // The target and the boundary are published before the talkspurt's own frames, so
-              // the render callback can never see resumed state without the audio behind it.
-              provider.PublishTarget(policy.PrebufferMs);
-              provider.MarkTalkspurt(++sourceTransitionId);
+              ops[opCount].Kind = OpKind.AdoptTarget; ops[opCount].TargetMs = policy.PrebufferMs; opCount++;
+              ops[opCount].Kind = OpKind.Talkspurt; ops[opCount].TransitionId = ++sourceTransitionId; opCount++;
             }
             if (spanBuf[si].Insert) {
               if (gGain != 1.0f) ApplyGain(assembler.Buffer_, spanBuf[si].Offset, spanBuf[si].Bytes, gGain);
-              provider.AddFrames(assembler.Buffer_, spanBuf[si].Offset, spanBuf[si].Bytes);
+              ops[opCount].Kind = OpKind.Pcm;
+              ops[opCount].Offset = spanBuf[si].Offset; ops[opCount].Bytes = spanBuf[si].Bytes; opCount++;
             }
             policy.OnMedia(readTicks, frames, spanBuf[si].Active);
-            // The threshold frame is media and has already been inserted; only now does the
-            // source count as confirmed.
+            // The threshold frame is media and is already in the batch ahead of this boundary;
+            // only now does the source count as confirmed.
             if (spanBuf[si].Edge == SourceEdge.Confirmed) {
               policy.SuspendDebt(readTicks);
               policy.ApplyIdleTarget(provider.RequestQuantumFrames);
-              provider.PublishTarget(policy.PrebufferMs);
-              OnConfirmedEntry(provider, policy, chain != null, ++sourceTransitionId);
+              ops[opCount].Kind = OpKind.AdoptTarget; ops[opCount].TargetMs = policy.PrebufferMs; opCount++;
+              if (chain != null) {
+                ops[opCount].Kind = OpKind.IdleStart; ops[opCount].TransitionId = ++sourceTransitionId; opCount++;
+              } else coldClear = true;
             }
           }
+          provider.Commit(assembler.Buffer_, ops, opCount, ++providerBatchId);
+          // With the output closed nothing is rendering, so this needs no atomicity.
+          if (coldClear) { provider.ClearForColdStart(); policy.ResetColdObservation(); }
           if (!classifier.Confirmed && spanCount > 0) {
             if (policy.AdoptArmed(provider.BufferedFrames, false)) provider.PublishTarget(policy.PrebufferMs);
           }
@@ -1755,7 +1846,7 @@ namespace AudioBridge {
     static readonly string[] ExpectedCases = new string[] {
       "exchange", "profile-mode", "R1", "R5", "R6", "R6b", "R10", "trim-attribution",
       "no-discard", "cadence", "cadence-teeth",
-      "A1", "A2", "A3", "A5", "A6", "A7", "C1", "C2",
+      "A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "A9", "C1", "C2",
       "R2", "R3", "R4", "R7", "R9", "P1", "P2", "P3", "P4",
       "clean-feed", "forced-adopt", "freshness",
     };
@@ -2085,6 +2176,80 @@ namespace AudioBridge {
       // reached behind that boundary because the source already went quiet, so waiting there
       // holds the phrase until some later talkspurt drags occupancy over the line and plays it
       // stale, before an unrelated sound. Confirmation must drain it instead.
+      // A4: one commit per read. The whole tuple becomes visible together, and replaying a batch
+      // is a no-op rather than a second copy of the audio. Before this, target, marker and PCM
+      // took the lock separately and a retried batch appended the PCM twice.
+      // A8: a boundary crossing resets interpolation phase, and drain never uses a post-boundary
+      // frame as lookahead. Both would leak a fraction of resumed program before the silence.
+      // A8: crossing a source boundary resets interpolation phase. A retained fraction would
+      // start the resumed program partway through its first source frame -- the one frame the
+      // specification explicitly protects.
+      //
+      // NOTE on the sibling guard: drain also reserves one frame before the boundary so
+      // interpolation lookahead cannot read across it. That guard is defensive and correct, but
+      // it is NOT falsifiable at this level -- Advance() runs inside the render loop, so the
+      // base index stays within already-consumed audio and no fixture distinguishes it. It is
+      // recorded as unverified rather than covered by a test that cannot fail.
+      Case("A8");
+      {
+        var prov = new AdaptivePlayout();
+        prov.PublishTarget(Audio.MinPrebufferMs);
+        int pre = 40;
+        prov.AddFrames(MakeTone(pre), 0, pre * 4);
+        prov.MarkIdleStart(1);
+        prov.SetRatioForTest(1.5);                          // leaves phase at 0.5
+        if (prov.PhaseForTest == 0)
+          throw new Exception("the fixture must start with a fractional phase, else A8 is vacuous");
+        byte[] outBuf = new byte[Audio.Frames(10) * 4];
+        for (int i = 0; i < 8; i++) prov.Read(outBuf, 0, outBuf.Length);
+        if (prov.RenderModeForTest != (int)RenderMode.IdleSilence)
+          throw new Exception("drain must reach the boundary");
+        if (prov.PhaseForTest != 0)
+          throw new Exception("crossing a boundary must reset interpolation phase, phase=" +
+            prov.PhaseForTest);
+      }
+
+      // A9: marker-FIFO overflow must fail fresh -- collapse the audio to the newest boundary,
+      // not merely forget the markers and leave old PCM behind unrelated render state.
+      Case("A9");
+      {
+        var prov = new AdaptivePlayout();
+        prov.PublishTarget(Audio.MinPrebufferMs);
+        int some = Audio.Frames(100);
+        prov.AddFrames(MakeTone(some), 0, some * 4);
+        for (int i = 1; i <= 40; i++) {                    // capacity is 32
+          if (i % 2 == 1) prov.MarkIdleStart(i); else prov.MarkTalkspurt(i);
+        }
+        if (prov.BufferedFrames != 0)
+          throw new Exception("overflow must collapse buffered audio to the newest boundary, " +
+            prov.BufferedFrames + " frames retained");
+      }
+
+      Case("A4");
+      {
+        var prov = new AdaptivePlayout();
+        var ops = new ProviderOp[8];
+        int chunkFrames = Audio.Frames(30);
+        byte[] pcm = MakeTone(chunkFrames);
+        ops[0].Kind = OpKind.AdoptTarget; ops[0].TargetMs = 200;
+        ops[1].Kind = OpKind.Talkspurt;   ops[1].TransitionId = 1;
+        ops[2].Kind = OpKind.Pcm;         ops[2].Offset = 0; ops[2].Bytes = chunkFrames * 4;
+        if (!prov.Commit(pcm, ops, 3, 1)) throw new Exception("a fresh batch must be applied");
+        int framesAfter = prov.BufferedFrames;
+        if (framesAfter != chunkFrames)
+          throw new Exception("the batch must insert its PCM exactly once, got " + framesAfter);
+        // The raised target must be IN FORCE, not merely pending. The ordinary adoption rule
+        // refuses a higher target until occupancy covers it, which would discard exactly the
+        // raise a resume boundary exists to apply.
+        if (prov.PrebufferFrames != Audio.Frames(200))
+          throw new Exception("a batch target must be adopted at the boundary, not left pending: got " +
+            prov.PrebufferFrames + " want " + Audio.Frames(200));
+        // Replay: same batch id.
+        if (prov.Commit(pcm, ops, 3, 1)) throw new Exception("a replayed batch id must be rejected");
+        if (prov.BufferedFrames != framesAfter)
+          throw new Exception("a replayed batch must not append its PCM again, now " + prov.BufferedFrames);
+      }
+
       Case("A7");
       {
         var prov = new AdaptivePlayout();
