@@ -1563,32 +1563,32 @@ namespace AudioBridge {
       public string TakeDescription() { lock (gate) { return description; } }
     }
 
-    // OnConfirmedEntry is the whole decision taken when the source is confirmed silent. It is
-    // CALLED FROM ProcessRead, so the tests and production exercise the same branch.
+    // BuildConfirmedEntry appends the ordered confirmation action to the batch under construction
+    // and returns the new op count.
     //
-    // With the output open the boundary goes into the audio and playback drains to it. With the
-    // output never opened there is no listener to drain to, so buffered pre-silence audio is
-    // merely stale: keeping it would play a fragment of an old phrase after the next talkspurt,
-    // a silence of arbitrary length later. The observation is forgotten with it, or the next
-    // talkspurt would open on evidence gathered before that silence.
-    // Returns true when the caller must DISCARD everything queued before this boundary. With the
-    // output closed there is no listener to drain to, so pre-silence audio is stale -- and it must
-    // be dropped at the boundary, in stream order, not after the batch commits. Clearing the whole
-    // provider afterwards also erased any RESUMED audio that arrived later in the same read.
-    static bool OnConfirmedEntry(AdaptivePlayout provider, ArrivalPolicy policy,
-                                 bool outputOpen, long transitionId) {
+    // With the output open the boundary MUST go into the batch, after the PCM already queued for
+    // this read. Placing it directly against the live provider put it at the provider's current
+    // write position -- ahead of the threshold frame and any qualifying audio still sitting in the
+    // batch. That audio then landed BEHIND the boundary, where the drain could never reach it: the
+    // renderer stopped at the boundary, entered idle silence, and the stranded frames blocked the
+    // talkspurt marker behind them. Nothing consumed, occupancy climbed, and the freshness trimmer
+    // was the only thing that ever crossed the marker -- discarding ~91 ms per resume, including
+    // the start of the audio the listener was waiting for.
+    //
+    // With the output closed there is no renderer, so the clear may happen immediately; returning
+    // 0 drops the pre-boundary audio, which is stale with nothing to drain it to.
+    static int BuildConfirmedEntry(AdaptivePlayout provider, ArrivalPolicy policy, ProviderOp[] ops,
+                                   int opCount, bool outputOpen, ref long transitionId) {
       if (outputOpen) {
-        provider.MarkIdleStart(transitionId);
-        return false;
+        ops[opCount].Kind = OpKind.IdleStart;
+        ops[opCount].TransitionId = ++transitionId;
+        return opCount + 1;
       }
       provider.ClearForColdStart();
       policy.ResetColdObservation();
-      return true;
+      return 0;
     }
 
-    // A read carries media only once it completes a whole stereo frame. A 1-3 byte read reaching
-    // the policy moved the arrival clock, opened epochs, consumed a telemetry measurement and took
-    // part in the cold-open decision -- making all of it depend on how TCP chopped the stream.
     // Before the first output open there is no render callback to adopt a published target, so the
     // endpoint would open against whatever was last adopted -- typically the floor -- however high
     // a target the measurement had already warranted. Factored out so the decision is under test.
@@ -1646,18 +1646,14 @@ namespace AudioBridge {
           c.Ops[opCount].Offset = c.Spans[si].Offset; c.Ops[opCount].Bytes = c.Spans[si].Bytes; opCount++;
         }
         c.Policy.OnMedia(readTicks, frames, c.Spans[si].Active);
-        // The threshold frame is media and is already in the batch ahead of this boundary; only
-        // now does the source count as confirmed.
+        // The threshold frame's PCM op is already in the batch; the boundary is appended after
+        // it below, so the drain reaches every qualifying frame before stopping.
         if (c.Spans[si].Edge == SourceEdge.Confirmed) {
           c.Policy.SuspendDebt(readTicks);
           c.Policy.ApplyIdleTarget(c.Provider.RequestQuantumFrames);
-          // Applied HERE, in stream order. Doing it after the commit discarded resumed audio that
-          // arrived later in the same read -- confirmation and resumption can both occur in one.
-          if (OnConfirmedEntry(c.Provider, c.Policy, c.OutputOpen, c.TransitionId + 1)) {
-            opCount = 0;                 // pre-boundary audio is stale with no output to drain to
-          } else {
-            c.TransitionId++;
-          }
+          // In the batch, in stream order, AFTER the threshold frame's PCM op above.
+          opCount = BuildConfirmedEntry(c.Provider, c.Policy, c.Ops, opCount, c.OutputOpen,
+                                        ref c.TransitionId);
           c.Ops[opCount].Kind = OpKind.AdoptTarget; c.Ops[opCount].TargetMs = c.Policy.PrebufferMs; opCount++;
         }
       }
@@ -1929,7 +1925,7 @@ namespace AudioBridge {
     static readonly string[] ExpectedCases = new string[] {
       "exchange", "profile-mode", "R1", "R5", "R6", "R6b", "R10", "trim-attribution",
       "no-discard", "cadence", "cadence-teeth",
-      "A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "A9", "A10", "A11", "C1", "C2", "C3",
+      "A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "A9", "A10", "A11", "A12", "C1", "C2", "C3",
       "R2", "R3", "R4", "R7", "R9", "P1", "P2", "P3", "P4",
       "clean-feed", "forced-adopt", "freshness",
     };
@@ -2379,6 +2375,40 @@ namespace AudioBridge {
             coldProv.PrebufferFrames);
       }
 
+      // A12: the ordering regression. Confirmation must place IDLE_START AFTER the PCM already
+      // queued for the same read. Placing it against the live provider put the boundary ahead of
+      // the threshold frame, stranding that audio behind it where the drain could never reach it,
+      // blocking the talkspurt marker, and leaving the freshness trimmer as the only thing that
+      // ever crossed -- discarding ~91 ms per resume including the start of the resumed audio.
+      Case("A12");
+      {
+        var pol = new ArrivalPolicy(); var cls = new SourceClassifier();
+        var ctx = new ReadContext {
+          Provider = new AdaptivePlayout(), Policy = pol, Classifier = cls,
+          Assembler = new FrameAssembler(1 << 21), Spans = new SourceSpan[512],
+          Ops = new ProviderOp[4096], OutputOpen = true,
+        };
+        ctx.Provider.PublishTarget(Audio.MinPrebufferMs);
+        // One read: a whole qualifying tail, so the threshold frame lands mid-batch.
+        byte[] tail = BuildStream(480, SquelchProfile.ConfirmFrames, 0);
+        ProcessRead(ctx, tail, tail.Length, Stopwatch.GetTimestamp(), false, 1.0);
+        if (!cls.Confirmed) throw new Exception("the fixture must confirm, else A12 proves nothing");
+        long trimsBefore = ctx.Provider.FreshnessTrimCount;
+        byte[] outBuf = new byte[Audio.Frames(10) * 4];
+        for (int i = 0; i < 400; i++) ctx.Provider.Read(outBuf, 0, outBuf.Length);
+        if (ctx.Provider.RenderModeForTest != (int)RenderMode.IdleSilence)
+          throw new Exception("the renderer must reach the idle boundary");
+        // Nothing meaningful may remain behind the boundary. The drain tolerates at most a couple
+        // of interpolation frames; 10-20 ms means qualifying audio was stranded past the marker.
+        int stranded = ctx.Provider.BufferedFrames;
+        if (stranded > 4)
+          throw new Exception("qualifying audio was stranded behind the idle boundary: " +
+            stranded + " frames (" + Audio.Ms(stranded) + " ms) -- the boundary was placed ahead " +
+            "of the PCM queued in the same read");
+        if (ctx.Provider.FreshnessTrimCount != trimsBefore)
+          throw new Exception("reaching a source boundary must not require a freshness trim");
+      }
+
       Case("A4");
       {
         var prov = new AdaptivePlayout();
@@ -2485,7 +2515,7 @@ namespace AudioBridge {
           throw new Exception("program must satisfy the cold observation, else C1 is vacuous");
         if (prov.BufferedFrames == 0)
           throw new Exception("the fixture must have buffered audio, else C1 is vacuous");
-        OnConfirmedEntry(prov, pol, false, 1);        // the production branch, output closed
+        { long tid = 0; var o = new ProviderOp[8]; BuildConfirmedEntry(prov, pol, o, 0, false, ref tid); }
         if (prov.BufferedFrames != 0)
           throw new Exception("a never-opened receiver must drop pre-silence audio, not replay it late");
         if (pol.ObservationSatisfied(t))
@@ -2495,7 +2525,7 @@ namespace AudioBridge {
         var openProv = new AdaptivePlayout();
         openProv.PublishTarget(Audio.MinPrebufferMs);
         openProv.AddFrames(program, 0, program.Length);
-        OnConfirmedEntry(openProv, new ArrivalPolicy(), true, 1);
+        { long tid2 = 0; var o2 = new ProviderOp[8]; int n2 = BuildConfirmedEntry(openProv, new ArrivalPolicy(), o2, 0, true, ref tid2); openProv.Commit(program, o2, n2, 1); }
         if (openProv.BufferedFrames == 0)
           throw new Exception("with the output open, pre-silence audio must be drained, not dropped");
         if (openProv.RenderModeForTest != (int)RenderMode.DrainToIdle)
