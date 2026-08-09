@@ -171,16 +171,12 @@ namespace AudioBridge {
     class ArrivalPolicy {
       const int StructuralWindow = 30;   // one-second peaks feeding the p90
       const int SpikeWindow = 10;        // one-second peaks feeding the repeated-spike rule
-      const double IdleGapMs = 500.0;    // no active-rate media for this long => suspect squelch
-      // Upper bound on a squelch heartbeat block, not an exact size: the sender's capture
-      // quantum is configurable (3-30 ms), so a heartbeat is anything from 576 B up. 4032 B
-      // is the largest quantum's block; a bigger silent read is program-sized silence and
-      // classifying it as a heartbeat is only ever a missed idle, never a false one.
-      const int KeepaliveBytes = 4032;
-      // Must be >= the sender's squelchThreshold (hear-capture.swift, default 16), or a
-      // keepalive reads as program and idle never fires. v1 has no way to negotiate it;
-      // protocol v2's SILENCE_START replaces this inference with a stated fact.
-      const short SilencePeak = 16;
+      // IdleGapMs, KeepaliveBytes and SilencePeak are GONE as state authorities. A 500 ms
+      // gap plus a heartbeat-sized silent read decided source silence from the shape of a
+      // TCP read, which is arbitrary; the amplitude threshold was a hand-written twin of the
+      // sender's and could drift. Source state now comes from SourceClassifier counting
+      // contiguous silent media frames against the one generated profile, and this class
+      // only accounts for arrival.
       const int HysteresisMs = 20;
       const int HoldSecondsBeforeLower = 60;
       const int LowerStepMs = 5;
@@ -195,19 +191,32 @@ namespace AudioBridge {
       readonly double[] scratch = new double[StructuralWindow];   // preallocated; no steady-state allocation
       int structuralCount, structuralHead, spikeCount, spikeHead;
 
-      long lastReadTicks, epochTicks, lastActiveTicks, lastLowerTicks, stableSinceTicks;
-      long firstActiveTicks, idleEnterTicks;
+      long lastReadTicks, epochTicks, lastLowerTicks, stableSinceTicks;
+      long firstActiveTicks, suspendTicks;
       int activeReads;
-      double outstandingDebtFrames, oneSecondPeakFrames, publishedDebtMs, lastIdleResumeMs;
+      double outstandingDebtFrames, oneSecondPeakFrames, publishedDebtMs, lastResumeMs;
       int reserveMs = Audio.MinReserveMs;
       int prebufferMs = Audio.MinPrebufferMs;
       int armedPrebufferMs;                 // raised target waiting for a safe adoption point
-      bool idle, started, lastReadSilent;
-      long idleEnterCount, idleExitCount, raiseCount, lowerCount, armedExpiredCount, squelchGapCount;
-      double squelchGapMaxMs;
+      bool started, debtSuspended;
+      long debtEpoch, squelchEnterCount, squelchExitCount;
+      long raiseCount, lowerCount, armedExpiredCount, excusedGapCount;
+      double excusedGapMaxMs;
       string targetReason = "init";
 
-      public bool Idle { get { return idle; } }
+      public bool DebtSuspended { get { return debtSuspended; } }
+      public long DebtEpoch { get { return debtEpoch; } }
+      public long SquelchEnterCount { get { return squelchEnterCount; } }
+      public long SquelchExitCount { get { return squelchExitCount; } }
+      public long LowerCount { get { return lowerCount; } }
+      public double OutstandingDebtMs { get { return outstandingDebtFrames * 1000.0 / Audio.SampleRate; } }
+      public int WarrantedForTest(int renderQuantumFrames) { return WarrantedPrebufferMs(Audio.Ms(renderQuantumFrames)); }
+      // The debt the current evidence justifies, in ms. Exposed so a test can assert that
+      // confirmation ended continuity without deleting the measurement behind it.
+      public double PublishedDebtMs(int renderQuantumFrames) {
+        WarrantedPrebufferMs(Audio.Ms(renderQuantumFrames));
+        return publishedDebtMs;
+      }
       public int PrebufferMs { get { return prebufferMs; } }
       public int ReserveMs { get { return reserveMs; } }
       public int PrebufferFrames { get { return Audio.Frames(prebufferMs); } }
@@ -223,105 +232,90 @@ namespace AudioBridge {
         return observedMs >= ColdStartObserveMs;
       }
 
-      public void ResetEpoch(long nowTicks) {
-        // A reconnect, explicit discontinuity or idle transition invalidates the debt
-        // history: the stream did not fall behind, it stopped. Keep the learned target.
+      // SuspendDebt ends debt CONTINUITY without deleting the evidence used to learn the
+      // target. The old ResetEpoch cleared oneSecondPeakFrames too, so a real stall in the
+      // second before the source went quiet was erased -- immediately before ApplyIdleTarget
+      // decided how far it could lower. Completed windows and the open bucket's peak survive;
+      // only the running carry and the arrival continuity go.
+      public void SuspendDebt(long nowTicks) {
+        if (debtSuspended) return;                 // heartbeats must not re-enter
+        debtSuspended = true;
+        suspendTicks = nowTicks;
+        squelchEnterCount++;
         lastReadTicks = 0;
-        epochTicks = nowTicks;
         outstandingDebtFrames = 0;
-        oneSecondPeakFrames = 0;
       }
 
-      // OnRead is called once per completed socket read, BEFORE the bytes reach the ring.
-      public void OnRead(long nowTicks, int bytes, short peak, double consumeRatio) {
-        bool silent = peak <= SilencePeak;
-        bool keepalive = silent && bytes <= KeepaliveBytes;
+      // ResumeDebt starts a fresh continuity epoch at the resuming read. The bucket clock is
+      // shifted forward by exactly the suspended wall time, so silence cannot manufacture
+      // "stable" seconds that the lowering hold would otherwise count.
+      public void ResumeDebt(long nowTicks) {
+        if (!debtSuspended) return;
+        debtSuspended = false;
+        squelchExitCount++;
+        lastResumeMs = suspendTicks == 0 ? 0 : (nowTicks - suspendTicks) * 1000.0 / ticksPerSecond;
+        if (suspendTicks != 0 && epochTicks != 0) epochTicks += nowTicks - suspendTicks;
+        if (suspendTicks != 0 && stableSinceTicks != 0) stableSinceTicks += nowTicks - suspendTicks;
+        suspendTicks = 0;
+        debtEpoch++;
+        lastReadTicks = nowTicks;
+        outstandingDebtFrames = 0;
+      }
 
-        // Whether the PRECEDING read was silent decides how to read the gap in front of
-        // this one, so latch it before any of the early returns below.
-        bool afterSilence = lastReadSilent;
-        lastReadSilent = silent;
-
-        // Squelch detection. A keepalive-sized silent block arriving after a gap means
-        // the source stopped sending program, not that the link fell behind.
-        // It must also fire when no program has EVER been seen: a receiver that starts
-        // while the Mac is already silent would otherwise treat every keepalive gap as
-        // lateness, accrue debt without bound, and pin the target at its ceiling.
-        if (keepalive && !idle) {
-          bool longGap = lastActiveTicks == 0 ||
-                         (nowTicks - lastActiveTicks) * 1000.0 / ticksPerSecond >= IdleGapMs;
-          if (longGap) {
-            idle = true;
-            idleEnterCount++;
-            idleEnterTicks = nowTicks;
-            ResetEpoch(nowTicks);
+      // OnGap accounts for the no-byte interval in FRONT of a read. The verdict comes from the
+      // state that existed before the read blocked -- never from what the returning bytes turn
+      // out to contain. Reaching the confirmation threshold inside the read that closes a gap
+      // must not retroactively excuse that gap: 11,999 silent frames, a 600 ms stall, then a
+      // threshold frame is a stall, not source silence.
+      public void OnGap(long nowTicks, bool gapStartedConfirmed, double consumeRatio) {
+        if (gapStartedConfirmed) {
+          if (lastReadTicks != 0) {
+            excusedGapCount++;
+            double ms = (nowTicks - lastReadTicks) * 1000.0 / ticksPerSecond;
+            if (ms > excusedGapMaxMs) excusedGapMaxMs = ms;
           }
+          lastReadTicks = nowTicks;
+          return;
         }
-
-        if (idle) {
-          if (silent) { lastReadTicks = nowTicks; return; }   // still squelched: nothing to measure
-          idle = false;
-          idleExitCount++;
-          lastIdleResumeMs = idleEnterTicks == 0 ? 0
-            : (nowTicks - idleEnterTicks) * 1000.0 / ticksPerSecond;
-          ResetEpoch(nowTicks);                                // resumption is not lateness
-        }
-
-        if (!silent) lastActiveTicks = nowTicks;
-
-        // Only program audio carries lateness. Accruing debt across a silent stretch
-        // would measure how long the source was quiet, not how late the link is.
-        if (silent) { lastReadTicks = nowTicks; return; }
-
-        if (firstActiveTicks == 0) firstActiveTicks = nowTicks;
-        activeReads++;
-        int receivedFrames = bytes / Audio.FrameBytes;
         if (lastReadTicks != 0) {
-          if (afterSilence) {
-            // A gap that opened after a SILENT read is treated as source squelch, not
-            // lateness. Charging it is what pinned the target at the ceiling: a pause
-            // shorter than the sender's 2 s keepalive puts no bytes on the wire at all,
-            // yet never reaches the keepalive-gap test that declares idle, so the whole
-            // pause was billed as arrival debt. Speech, video and gaps between tracks are
-            // made of such pauses.
-            //
-            // KNOWN TOO WIDE (audited 2026-08-09, do/gptpro/receiver-oscillation-path-audit_ingest_20260809.md).
-            // This does NOT verify that squelchHold (0.25 s) of silence preceded the gap.
-            // ANY single completed TCP read with peak <= SilencePeak arms the excusal, and
-            // read boundaries are arbitrary -- this file already carries split frames across
-            // reads. So one silent quantum can forgive an ordinary program stall that began
-            // before the sender ever entered squelch. The direction is right and the
-            // underrun-driven raise still backstops it, but the exposure is wider than a
-            // stall starting inside the hold. The fix is to count contiguous silent MEDIA
-            // FRAMES (12,000 = 250 ms) on both ends and excuse only from a confirmed squelch;
-            // it needs the matching sender change, so it is staged, not sneaked in here.
-            squelchGapCount++;
-            double gapMs = (nowTicks - lastReadTicks) * 1000.0 / ticksPerSecond;
-            if (gapMs > squelchGapMaxMs) squelchGapMaxMs = gapMs;
-            outstandingDebtFrames = 0;   // what ResetEpoch already gives a declared idle
-          } else {
-            // Expected arrival rate is the rate the ring is actually drained at, which
-            // is the nominal rate scaled by the clock-correction ratio.
-            double rate = Audio.SampleRate * (consumeRatio > 0 ? consumeRatio : 1.0);
-            double dueFrames = (nowTicks - lastReadTicks) / ticksPerSecond * rate;
-            double debtBeforeRead = outstandingDebtFrames + dueFrames;
-            if (debtBeforeRead < 0) debtBeforeRead = 0;
-            // A gap wider than the largest buffer we would ever hold is a stall, not
-            // jitter. One rebuffer answers it; proposing an unreachable target does not.
-            double cap = Audio.Frames(Audio.MaxPrebufferMs);
-            if (debtBeforeRead > cap) debtBeforeRead = cap;
-            if (debtBeforeRead > oneSecondPeakFrames) oneSecondPeakFrames = debtBeforeRead;
-            outstandingDebtFrames = debtBeforeRead - receivedFrames;
-            if (outstandingDebtFrames < 0) outstandingDebtFrames = 0;
-          }
+          double rate = Audio.SampleRate * (consumeRatio > 0 ? consumeRatio : 1.0);
+          double dueFrames = (nowTicks - lastReadTicks) / ticksPerSecond * rate;
+          double debtBeforeRead = outstandingDebtFrames + dueFrames;
+          if (debtBeforeRead < 0) debtBeforeRead = 0;
+          // A gap wider than the largest buffer we would ever hold is a stall, not jitter.
+          // One rebuffer answers it; proposing an unreachable target does not.
+          double cap = Audio.Frames(Audio.MaxPrebufferMs);
+          if (debtBeforeRead > cap) debtBeforeRead = cap;
+          if (debtBeforeRead > oneSecondPeakFrames) oneSecondPeakFrames = debtBeforeRead;
+          outstandingDebtFrames = debtBeforeRead;
         }
         lastReadTicks = nowTicks;
         if (epochTicks == 0) epochTicks = nowTicks;
+      }
 
-        if ((nowTicks - epochTicks) / ticksPerSecond >= 1.0) {
-          CloseSecond(nowTicks);
+      // OnMedia pays down the charge with frames that were actually transmitted. EVERY frame
+      // sent before confirmation is media, silent or not: the qualifying tail is real bytes on
+      // the wire and it pays. The retired rule that "only program audio carries lateness" is
+      // what let an unconfirmed silent stretch look free.
+      public void OnMedia(long nowTicks, int frames, bool active) {
+        if (frames <= 0) return;
+        if (active) {
+          if (firstActiveTicks == 0) firstActiveTicks = nowTicks;
+          activeReads++;
         }
+        if (debtSuspended) return;                 // confirmed silence pays nothing down
+        outstandingDebtFrames -= frames;
+        if (outstandingDebtFrames < 0) outstandingDebtFrames = 0;
         started = true;
+        if (epochTicks != 0 && (nowTicks - epochTicks) / ticksPerSecond >= 1.0) CloseSecond(nowTicks);
+      }
+
+      // ResetForConnection clears everything a new TCP connection must not inherit. The learned
+      // windows go too: a new stream has not been measured yet.
+      public void ResetForConnection() {
+        lastReadTicks = 0; epochTicks = 0; suspendTicks = 0; firstActiveTicks = 0;
+        activeReads = 0; outstandingDebtFrames = 0; oneSecondPeakFrames = 0;
+        debtSuspended = false;
       }
 
       void CloseSecond(long nowTicks) {
@@ -339,6 +333,10 @@ namespace AudioBridge {
       // It never touches the ring; it only decides the numbers the ring will adopt.
       public void Recompute(long nowTicks, int renderQuantumFrames, bool underrunSinceLast) {
         if (!started) return;
+        // Frozen while the source is confirmed silent. Silence is not evidence about the path,
+        // and letting the hold clock run through it would let a quiet minute masquerade as a
+        // stable one and cash in a lowering the link never earned.
+        if (debtSuspended) return;
         int quantumMs = Audio.Ms(renderQuantumFrames);
         int wantPrebuffer = WarrantedPrebufferMs(quantumMs);
 
@@ -396,7 +394,11 @@ namespace AudioBridge {
       int WarrantedPrebufferMs(int quantumMs) {
         double structuralDebt = Percentile(structural, structuralCount, 0.90);
         double spikeDebt = SecondLargest(spike, spikeCount);
-        publishedDebtMs = Math.Max(structuralDebt, spikeDebt) * 1000.0 / Audio.SampleRate;
+        // The OPEN bucket counts too. Completed windows alone meant a stall measured in the
+        // second before the source went quiet was invisible to the very call that decides how
+        // far the target may drop at confirmation.
+        double worst = Math.Max(Math.Max(structuralDebt, spikeDebt), oneSecondPeakFrames);
+        publishedDebtMs = worst * 1000.0 / Audio.SampleRate;
 
         int wantReserve = (int)Math.Ceiling(publishedDebtMs) + Audio.ReserveMarginMs;
         int reserveCeiling = Audio.MaxPrebufferMs - quantumMs;
@@ -460,13 +462,13 @@ namespace AudioBridge {
           "arrival_debt_ms={0:0.0} arrival_debt_p50_ms={1:0.0} arrival_debt_p99_ms={2:0.0} " +
           "reserve_target_ms={3} prebuffer_target_ms={4} target_armed_ms={5} " +
           "target_raise={6} target_lower={7} target_armed_expired={8} target_reason={9} " +
-          "idle_enter={10} idle_exit={11} idle_resume_ms={12:0.0} idle={13} " +
-          "squelch_gap={14} squelch_gap_max_ms={15:0.0}",
+          "squelch_enter={10} squelch_exit={11} squelch_resume_ms={12:0.0} debt_suspended={13} " +
+          "excused_gap={14} excused_gap_max_ms={15:0.0} debt_epoch={16}",
           publishedDebtMs, p50, p99,
           reserveMs, prebufferMs, armedPrebufferMs,
           raiseCount, lowerCount, armedExpiredCount, targetReason,
-          idleEnterCount, idleExitCount, lastIdleResumeMs, idle ? 1 : 0,
-          squelchGapCount, squelchGapMaxMs);
+          squelchEnterCount, squelchExitCount, lastResumeMs, debtSuspended ? 1 : 0,
+          excusedGapCount, excusedGapMaxMs, debtEpoch);
       }
     }
 
@@ -991,6 +993,7 @@ namespace AudioBridge {
       public int Bytes;         // length, frame-aligned
       public bool Insert;       // false only for confirmed-squelch silence (heartbeats)
       public bool PaysDebt;     // true while unconfirmed or qualifying: it is transmitted media
+      public bool Active;       // the span contained at least one non-silent frame
       public SourceEdge Edge;   // a transition occurring AT this span's first frame
     }
 
@@ -1049,6 +1052,7 @@ namespace AudioBridge {
                   spans[count].Bytes = SquelchProfile.FrameBytes;
                   spans[count].Insert = true;
                   spans[count].PaysDebt = true;
+                  spans[count].Active = false;
                   spans[count].Edge = edge;
                   count++;
                 }
@@ -1060,6 +1064,7 @@ namespace AudioBridge {
 
           // Extend while the frame's disposition matches this span's.
           bool spanConfirmed = confirmed;
+          bool sawActive = !silent;
           int j = i + 1;
           while (j < frames) {
             int aj = offset + j * SquelchProfile.FrameBytes;
@@ -1070,7 +1075,7 @@ namespace AudioBridge {
               if (sj) {
                 if (silentRun + 1 >= SquelchProfile.ConfirmFrames) break;   // threshold ends it
                 silentRun++;
-              } else silentRun = 0;
+              } else { silentRun = 0; sawActive = true; }
             }
             j++;
           }
@@ -1080,6 +1085,7 @@ namespace AudioBridge {
             spans[count].Bytes = (j - spanStart) * SquelchProfile.FrameBytes;
             spans[count].Insert = !spanConfirmed;
             spans[count].PaysDebt = !spanConfirmed;
+            spans[count].Active = !spanConfirmed && sawActive;
             spans[count].Edge = edge;
             count++;
           }
@@ -1100,45 +1106,24 @@ namespace AudioBridge {
       readonly byte[] joined;
       readonly byte[] tail = new byte[4];
       int tailCount, completeBytes;
-      short lastPeak;
       public FrameAssembler(int maxRead) { joined = new byte[maxRead + 4]; }
       public int TailBytes { get { return tailCount; } }
-      public short LastPeak { get { return lastPeak; } }
-      public int CompleteBytes { get { return completeBytes; } }
+
 
       // Assemble carries the split-frame tail and measures the block's peak. It never
       // touches the ring, because the insert decision needs the peak and the peak needs
       // the assembled bytes: the policy must see this block BEFORE it is inserted.
-      public int Assemble(byte[] input, int n, float gain) {
-        if (tailCount > 0) Buffer.BlockCopy(tail, 0, joined, 0, tailCount);
-        Buffer.BlockCopy(input, 0, joined, tailCount, n);
+      public byte[] Buffer_ { get { return joined; } }
+      public int Assemble(byte[] input, int n) {
+        if (tailCount > 0) System.Buffer.BlockCopy(tail, 0, joined, 0, tailCount);
+        System.Buffer.BlockCopy(input, 0, joined, tailCount, n);
         int total = tailCount + n;
-        completeBytes = total / 4 * 4;
+        completeBytes = total / SquelchProfile.FrameBytes * SquelchProfile.FrameBytes;
         tailCount = total - completeBytes;
-        if (tailCount > 0) Buffer.BlockCopy(joined, completeBytes, tail, 0, tailCount);
-        lastPeak = Peak(joined, completeBytes);
-        if (completeBytes > 0 && gain != 1.0f) ApplyGain(joined, completeBytes, gain);
+        if (tailCount > 0) System.Buffer.BlockCopy(joined, completeBytes, tail, 0, tailCount);
         return completeBytes;
       }
 
-      // Flush hands the assembled frames to the ring. The caller skips it only while the
-      // source is squelched, so the keepalive heartbeat never becomes program material.
-      // Alignment survives either way because Assemble already consumed the bytes.
-      public void Flush(AdaptivePlayout dest) {
-        if (completeBytes > 0) dest.AddFrames(joined, 0, completeBytes);
-      }
-
-      // Peak is measured on the network thread, before insertion, so the render
-      // callback never inspects program content to decide anything.
-      static short Peak(byte[] b, int n) {
-        int peak = 0;
-        for (int i = 0; i + 1 < n; i += 2) {
-          int s = (short)(b[i] | (b[i + 1] << 8));
-          if (s < 0) s = -s;
-          if (s > peak) peak = s;
-        }
-        return peak > short.MaxValue ? short.MaxValue : (short)peak;
-      }
     }
 
     class OutputChain {
@@ -1260,8 +1245,9 @@ namespace AudioBridge {
     }
 
     // ApplyGain scales s16le samples in-place (clamped). Used for 0-100% playback volume.
-    static void ApplyGain(byte[] b, int n, float g) {
-      for (int i = 0; i + 1 < n; i += 2) {
+    static void ApplyGain(byte[] b, int n, float g) { ApplyGain(b, 0, n, g); }
+    static void ApplyGain(byte[] b, int offset, int n, float g) {
+      for (int i = offset; i + 1 < offset + n; i += 2) {
         short s = (short)(b[i] | (b[i + 1] << 8));
         int v = (int)(s * g);
         if (v > 32767) v = 32767; else if (v < -32768) v = -32768;
@@ -1309,6 +1295,8 @@ namespace AudioBridge {
     static void RunPlay(NetworkStream net) {
       var provider = new AdaptivePlayout();
       var policy = new ArrivalPolicy();
+      var classifier = new SourceClassifier();
+      var spanBuf = new SourceSpan[256];
       OutputChain chain = null;
       byte[] tmp = new byte[SourceFmt.AverageBytesPerSecond / 20]; // ~50ms
       var assembler = new FrameAssembler(tmp.Length);
@@ -1355,27 +1343,51 @@ namespace AudioBridge {
 
       try {
         while (true) {
+          // Latched BEFORE blocking. Reaching the confirmation threshold inside the read that
+          // closes a gap must never retroactively excuse that gap.
+          bool gapStartedConfirmed = classifier.Confirmed;
           int n = net.Read(tmp, 0, tmp.Length);
           if (n <= 0) break;
           long readTicks = Stopwatch.GetTimestamp();
           long readAt = sw.ElapsedMilliseconds;
-          bool wasIdle = policy.Idle;
-          // Assemble -> classify -> insert. The policy must judge this block before it
-          // reaches the ring; deciding from the PREVIOUS idle state discarded the first
-          // block of program audio after every squelch gap.
-          int complete = assembler.Assemble(tmp, n, gGain);
-          policy.OnRead(readTicks, n, assembler.LastPeak, provider.RatioSnapshot);
-          if (!policy.Idle) assembler.Flush(provider);
-          if (policy.Idle != wasIdle) {
-            provider.SetIdle(policy.Idle);
-            // An idle boundary is the free moment to move the target: nothing is playing,
-            // so a change interrupts nothing. Entering idle takes the whole reduction the
-            // measurement warrants; leaving it adopts a raise only if the measurement
-            // still warrants one, so a stale armed value cannot be cashed in here.
-            if (policy.Idle) policy.ApplyIdleTarget(provider.RequestQuantumFrames);
-            else policy.AdoptArmed(provider.BufferedFrames, true);
-            provider.PublishTarget(policy.PrebufferMs);
-          } else if (!policy.Idle) {
+          // Assemble WITHOUT gain: classification must read source PCM, so that a low
+          // playback gain can never make program audio look like silence (R10). Gain is
+          // applied per span, and only to spans that will actually be inserted.
+          int complete = assembler.Assemble(tmp, n);
+
+          // The gap in FRONT of this read is judged by the state that existed before the
+          // read blocked -- never by what the returning bytes turn out to contain.
+          policy.OnGap(readTicks, gapStartedConfirmed, provider.RatioSnapshot);
+
+          int spanCount = classifier.Scan(assembler.Buffer_, 0, complete, spanBuf);
+          for (int si = 0; si < spanCount; si++) {
+            int frames = spanBuf[si].Bytes / SquelchProfile.FrameBytes;
+            // Resume happens BEFORE its own frames are handled: the talkspurt's first frame
+            // must not repay debt from the interval that was excused.
+            if (spanBuf[si].Edge == SourceEdge.Resumed) {
+              policy.ResumeDebt(readTicks);
+              // INTERIM (Phase 1 step 5): the render timeline still swings on SetIdle. The
+              // spec requires a TALKSPURT_START marker so playback, which lags the network,
+              // crosses the boundary at the right frame instead of on a live Boolean.
+              provider.SetIdle(false);
+              policy.AdoptArmed(provider.BufferedFrames, true);
+              provider.PublishTarget(policy.PrebufferMs);
+            }
+            if (spanBuf[si].Insert) {
+              if (gGain != 1.0f) ApplyGain(assembler.Buffer_, spanBuf[si].Offset, spanBuf[si].Bytes, gGain);
+              provider.AddFrames(assembler.Buffer_, spanBuf[si].Offset, spanBuf[si].Bytes);
+            }
+            policy.OnMedia(readTicks, frames, spanBuf[si].Active);
+            // The threshold frame is media and has already been inserted; only now does the
+            // source count as confirmed.
+            if (spanBuf[si].Edge == SourceEdge.Confirmed) {
+              policy.SuspendDebt(readTicks);
+              policy.ApplyIdleTarget(provider.RequestQuantumFrames);
+              provider.PublishTarget(policy.PrebufferMs);
+              provider.SetIdle(true);   // INTERIM (Phase 1 step 5): must become DRAIN_TO_IDLE
+            }
+          }
+          if (!classifier.Confirmed && spanCount > 0) {
             if (policy.AdoptArmed(provider.BufferedFrames, false)) provider.PublishTarget(policy.PrebufferMs);
           }
           // A hard rebuffer is the design's other adoption point, and the load-bearing one:
@@ -1411,7 +1423,7 @@ namespace AudioBridge {
           // open as soon as the path is characterised (three active reads, or 150 ms of
           // program observed, hard-capped at 400 ms) AND the buffer has reached the target
           // that measurement produced. Never open into a squelched stream.
-          if (chain == null && !policy.Idle && policy.ObservationSatisfied(readTicks) &&
+          if (chain == null && !classifier.Confirmed && policy.ObservationSatisfied(readTicks) &&
               provider.BufferedFrames >= provider.PrebufferFrames) {
             reconcileRequested = false;
             // The first open is an outage too: nothing drains the ring until the endpoint is
@@ -1525,43 +1537,87 @@ namespace AudioBridge {
       }
     }
 
+    // DriveRead mirrors the read loop's ordering exactly: latch the gap verdict BEFORE the
+    // read, charge the gap, then walk the spans in stream order, resuming before a talkspurt's
+    // own frames and confirming only after the threshold frame has been counted as media.
+    static void DriveRead(ArrivalPolicy pol, SourceClassifier cls, SourceSpan[] spans,
+                          long atTicks, byte[] pcm, int offset, int bytes) {
+      bool gapStartedConfirmed = cls.Confirmed;
+      pol.OnGap(atTicks, gapStartedConfirmed, 1.0);
+      int n = cls.Scan(pcm, offset, bytes, spans);
+      for (int i = 0; i < n; i++) {
+        if (spans[i].Edge == SourceEdge.Resumed) pol.ResumeDebt(atTicks);
+        pol.OnMedia(atTicks, spans[i].Bytes / SquelchProfile.FrameBytes, spans[i].Active);
+        if (spans[i].Edge == SourceEdge.Confirmed) pol.SuspendDebt(atTicks);
+      }
+    }
+
     static void RunSelfTest() {
-      var splitProvider = new AdaptivePlayout();
-      var assembler = new FrameAssembler(8);
-      byte[] oneFrame = new byte[] { 0xd0, 0x07, 0x30, 0xf8 }; // +2000, -2000
-      assembler.Assemble(oneFrame, 1, 1.0f); assembler.Flush(splitProvider);
-      byte[] remainder = new byte[] { 0x07, 0x30, 0xf8 };
-      assembler.Assemble(remainder, remainder.Length, 1.0f); assembler.Flush(splitProvider);
-      if (assembler.TailBytes != 0 || splitProvider.BufferedFrames != 1)
-        throw new Exception("frame assembler failed split-frame carry");
+      // R6: a partial frame advances nothing. One, two or three bytes must not classify, must
+      // not move the arrival clock, and must not start or finish qualification -- the final
+      // byte completes exactly one frame. This is what makes a one-byte read and a coalesced
+      // read semantically identical.
+      {
+        var assembler = new FrameAssembler(64);
+        byte[] oneFrame = new byte[] { 0xd0, 0x07, 0x30, 0xf8 }; // +2000, -2000
+        if (assembler.Assemble(oneFrame, 1) != 0)
+          throw new Exception("one byte cannot complete a stereo frame");
+        if (assembler.TailBytes != 1) throw new Exception("the partial byte must be carried");
+        if (assembler.Assemble(oneFrame, 2) != 0)
+          throw new Exception("three bytes still cannot complete a stereo frame");
+        if (assembler.Assemble(oneFrame, 1) != SquelchProfile.FrameBytes)
+          throw new Exception("the fourth byte must complete exactly one frame");
+        if (assembler.TailBytes != 0) throw new Exception("no tail may remain after a whole frame");
 
-      // A withheld block still consumes its bytes and keeps frame alignment.
-      var idleProvider = new AdaptivePlayout();
-      var idleAssembler = new FrameAssembler(8);
-      idleAssembler.Assemble(oneFrame, oneFrame.Length, 1.0f);   // no Flush: squelched
-      if (idleAssembler.TailBytes != 0 || idleProvider.BufferedFrames != 0)
-        throw new Exception("a withheld block must consume bytes without inserting");
-      // ...and the NEXT block, once program resumes, must still reach the ring. Deciding
-      // insertion from the previous idle state dropped exactly this block.
-      idleAssembler.Assemble(oneFrame, oneFrame.Length, 1.0f);
-      idleAssembler.Flush(idleProvider);
-      if (idleProvider.BufferedFrames != 1)
-        throw new Exception("the first block after squelch must not be discarded");
+        // Driving the classifier a byte at a time must reach the identical verdict as one
+        // whole-block read: read shape is not evidence.
+        var byteCls = new SourceClassifier(); var byteAsm = new FrameAssembler(64);
+        var sp = new SourceSpan[16];
+        byte[] stream = BuildStream(0, 3, 1);          // 3 silent frames then program
+        int completedFrames = 0, activeSpans = 0;
+        byte[] one = new byte[1];
+        for (int i = 0; i < stream.Length; i++) {
+          one[0] = stream[i];
+          int done = byteAsm.Assemble(one, 1);
+          if (done > 0) {
+            completedFrames += done / SquelchProfile.FrameBytes;
+            int n = byteCls.Scan(byteAsm.Buffer_, 0, done, sp);
+            for (int k = 0; k < n; k++) if (sp[k].Active) activeSpans++;
+          }
+        }
+        if (completedFrames != 4) throw new Exception("byte-at-a-time must complete exactly 4 frames");
+        if (activeSpans != 1) throw new Exception("byte-at-a-time must still see exactly one program run");
+        if (byteCls.SilentRun != 0) throw new Exception("program must reset the silent run");
+      }
 
-      byte[] gained = new byte[] { 0xd0, 0x07, 0x30, 0xf8 };
-      ApplyGain(gained, gained.Length, 0.5f);
-      short gl = (short)(gained[0] | (gained[1] << 8));
-      short gr = (short)(gained[2] | (gained[3] << 8));
-      if (gl != 1000 || gr != -1000) throw new Exception("gain test failed");
+      {
+        byte[] gained = new byte[] { 0xd0, 0x07, 0x30, 0xf8 };
+        ApplyGain(gained, gained.Length, 0.5f);
+        short gl = (short)(gained[0] | (gained[1] << 8));
+        short gr = (short)(gained[2] | (gained[3] << 8));
+        if (gl != 1000 || gr != -1000) throw new Exception("gain test failed");
+      }
 
-      // Peak observation drives squelch detection, so it must see program content.
-      var peakAssembler = new FrameAssembler(8);
-      var peakSink = new AdaptivePlayout();
-      peakAssembler.Assemble(oneFrame, oneFrame.Length, 1.0f); peakAssembler.Flush(peakSink);
-      if (peakAssembler.LastPeak != 2000) throw new Exception("peak observation failed");
-      byte[] quiet = new byte[] { 0x01, 0x00, 0x00, 0x00 };
-      peakAssembler.Assemble(quiet, quiet.Length, 1.0f); peakAssembler.Flush(peakSink);
-      if (peakAssembler.LastPeak > 16) throw new Exception("silent block must read as silent");
+      // R10: classification reads SOURCE pcm, before gain. At zero gain every inserted sample
+      // is silent, and classifying post-gain audio would declare the source squelched and start
+      // forgiving real network gaps.
+      {
+        var cls = new SourceClassifier(); var sp = new SourceSpan[16];
+        byte[] program = BuildStream(0, 0, 480);
+        int n = cls.Scan(program, 0, program.Length, sp);
+        bool sawActive = false;
+        for (int i = 0; i < n; i++) if (sp[i].Active) sawActive = true;
+        if (!sawActive) throw new Exception("program must classify as active");
+        ApplyGain(program, 0, program.Length, 0.0f);      // silence it AFTER classification
+        var post = new SourceClassifier();
+        int m = post.Scan(program, 0, program.Length, sp);
+        bool postActive = false;
+        for (int i = 0; i < m; i++) if (sp[i].Active) postActive = true;
+        if (postActive)
+          throw new Exception("test is vacuous: zeroed audio must read as silent");
+        if (post.SilentRun == 0)
+          throw new Exception("test is vacuous: zeroed audio must accumulate a silent run");
+      }
 
       // Steady-state fidelity: after the opening fade, reconstruction is exact.
       var provider = Primed(Audio.Frames(300));
@@ -1616,261 +1672,230 @@ namespace AudioBridge {
       if (undersized.HardRebufferCount + undersized.SoftUnderrunCount == 0)
         throw new Exception("undersized target must starve, else the cadence test proves nothing");
 
-      // Squelch seen from a cold start. This shipped broken: idle only fired if program
-      // audio had already been seen, so a receiver that started while the Mac was
-      // silent treated every 2 s keepalive gap as lateness, accrued 14 s of debt and
-      // pinned the target at its 400 ms ceiling.
-      var pol = new ArrivalPolicy();
-      long perSec = Stopwatch.Frequency, t0 = Stopwatch.GetTimestamp();
-      for (int i = 0; i < 6; i++) pol.OnRead(t0 + (long)(i * 2.0 * perSec), 4032, 0, 1.0);
-      if (!pol.Idle) throw new Exception("silent keepalives must enter idle with no prior program");
-      pol.Recompute(t0 + (long)(12 * perSec), Audio.Frames(10), false);
-      if (pol.PrebufferMs > Audio.MinPrebufferMs + 20)
-        throw new Exception("squelch must not inflate the target");
-      pol.OnRead(t0 + (long)(14 * perSec), 9600, 3000, 1.0);
-      if (pol.Idle) throw new Exception("program audio must exit idle");
+      // ---- arrival accounting, driven exactly as production drives it ------------------
+      // These replace the old keepalive-era suite. Source state is no longer a Boolean this
+      // class owns, and "was the last read silent" is no longer evidence of anything.
+      long perSec = Stopwatch.Frequency;
+      const int HysteresisForTest = 20;
 
-      // Wired proxy: a steady low-jitter feed must not be charged a jitter tax. One 21 ms
-      // sender block every 21 ms is what a clean Ethernet path looks like from here.
-      var clean = new ArrivalPolicy();
-      long c0 = Stopwatch.GetTimestamp();
-      for (int i = 0; i < 200; i++) {
-        long t = c0 + (long)(i * 0.021 * perSec);
-        clean.OnRead(t, 4032, 3000, 1.0);
-        clean.Recompute(t, Audio.Frames(10), false);
-      }
-      if (clean.PrebufferMs > Audio.MinPrebufferMs)
-        throw new Exception("a clean link must stay at the floor, not inherit a bursty path's target");
-
-      // Intermittent content on a clean link. A pause SHORTER than the sender's 2 s
-      // keepalive puts no bytes on the wire, so it never reaches the 500 ms keepalive-gap
-      // test that declares idle -- and the whole pause used to be billed as arrival debt.
-      // Measured on bmst->bzot: 18 h pinned at the 400 ms ceiling over wired Ethernet
-      // whose own jitter warrants 40 ms. Speech, video and gaps between tracks are made
-      // of exactly these pauses.
-      var speech = new ArrivalPolicy();
-      long p0 = Stopwatch.GetTimestamp(), pt = p0;
-      for (int phrase = 0; phrase < 15; phrase++) {
-        for (int i = 0; i < 95; i++) {                  // ~2 s of program at the 21 ms quantum
-          pt += (long)(0.021 * perSec);
-          speech.OnRead(pt, 4032, 3000, 1.0);
-          speech.Recompute(pt, Audio.Frames(10), false);
-        }
-        for (int i = 0; i < 12; i++) {                  // squelchHold: 0.25 s of silence sent
-          pt += (long)(0.021 * perSec);
-          speech.OnRead(pt, 4032, 0, 1.0);
-          speech.Recompute(pt, Audio.Frames(10), false);
-        }
-        pt += (long)(0.600 * perSec);                   // squelched: nothing on the wire at all
-      }
-      if (speech.Idle)
-        throw new Exception("a sub-keepalive pause must not reach idle, else this proves nothing");
-      speech.AdoptArmed(Audio.Frames(Audio.MaxPrebufferMs), true);   // cash in anything armed
-      if (speech.PrebufferMs > Audio.MinPrebufferMs)
-        throw new Exception("a short source pause must not be charged as arrival debt");
-
-      // Teeth: the same 600 ms gap opening after PROGRAM audio is a real stall, and must
-      // still raise. Excusing every gap would pass the check above and be worthless.
-      var stall = new ArrivalPolicy();
-      long q0 = Stopwatch.GetTimestamp(), qt = q0;
-      for (int phrase = 0; phrase < 15; phrase++) {
-        for (int i = 0; i < 95; i++) {
-          qt += (long)(0.021 * perSec);
-          stall.OnRead(qt, 4032, 3000, 1.0);
-          stall.Recompute(qt, Audio.Frames(10), false);
-        }
-        qt += (long)(0.600 * perSec);                   // no silent hold: the link just stopped
-      }
-      stall.AdoptArmed(Audio.Frames(Audio.MaxPrebufferMs), true);
-      if (stall.PrebufferMs <= Audio.MinPrebufferMs)
-        throw new Exception("a real stall must still raise the target");
-
-      // Device-notification filtering. The shipped version reopened the output on ANY render
-      // default change regardless of role (Windows raises one per role), on ANY endpoint going
-      // non-active, and on ANY removal. The field log shows eight output generations in ~13 s
-      // and every freshness trim of that run sitting inside the burst, discarding 1,534.5 ms of
-      // audio that had already arrived.
-      var nc = new Play();
-      activeEndpointId = "ACTIVE-ENDPOINT";
-      reconcileRequested = false;
-      nc.OnDefaultDeviceChanged(DataFlow.Render, Role.Console, "OTHER");
-      if (reconcileRequested) throw new Exception("a non-Multimedia role must not reopen the output");
-      nc.OnDefaultDeviceChanged(DataFlow.Capture, Role.Multimedia, "OTHER");
-      if (reconcileRequested) throw new Exception("a capture default change must not reopen the output");
-      nc.OnDeviceStateChanged("OTHER", DeviceState.Disabled);
-      if (reconcileRequested) throw new Exception("an unrelated endpoint going inactive must not reopen the output");
-      nc.OnDeviceRemoved("OTHER");
-      if (reconcileRequested) throw new Exception("removing an unrelated endpoint must not reopen the output");
-      nc.OnDeviceAdded("OTHER");
-      if (reconcileRequested) throw new Exception("adding an endpoint must not reopen the output");
-
-      // Teeth: the events that genuinely change which endpoint we belong on must still act,
-      // or the filter above would be indistinguishable from ignoring device changes entirely.
-      nc.OnDefaultDeviceChanged(DataFlow.Render, Role.Multimedia, "NEW-DEFAULT");
-      if (!reconcileRequested) throw new Exception("a render/multimedia default change must reconcile");
-      reconcileRequested = false;
-      nc.OnDeviceStateChanged("ACTIVE-ENDPOINT", DeviceState.Unplugged);
-      if (!reconcileRequested) throw new Exception("the active endpoint going inactive must reconcile");
-      reconcileRequested = false;
-      nc.OnDeviceRemoved("ACTIVE-ENDPOINT");
-      if (!reconcileRequested) throw new Exception("removing the active endpoint must reconcile");
-      reconcileRequested = false;
-
-      // The feedback loop itself: a teardown we chose raises PlaybackStopped, and treating that
-      // as a device change re-armed the reconciliation that caused it. Retired must suppress it,
-      // and only it -- an unexpected stop is still a real signal worth acting on.
-      var liveChain = new OutputChain();
-      if (!ShouldReconcileOnStop(liveChain))
-        throw new Exception("an unexpected playback stop must still reconcile");
-      liveChain.Retired = true;
-      if (ShouldReconcileOnStop(liveChain))
-        throw new Exception("our own teardown must not re-arm reconciliation (the reopen storm)");
-      activeEndpointId = null;
-
-      // ---- SourceClassifier: R1 exact boundary, R5 read-shape invariance ----------------
-      // The defect being replaced decided source silence from a whole-read peak and a
-      // "was the last read silent" latch, so ONE silent quantum could forgive a real transport
-      // stall, and the verdict changed with how TCP happened to chop the stream.
+      // R7: every frame transmitted before confirmation is media and pays down debt, silent or
+      // not. The retired rule that only program audio carried lateness is what made an
+      // unconfirmed silent stretch look free.
       {
-        // frames: [activeBefore][silent][activeAfter], classified in several chunk shapes.
-        const int activeBefore = 100, activeAfter = 50;
-        int[] chunkShapes = new int[] { 1, 2, 3, 7, 257, 4096, 0 };   // frames per Scan call; 0 = all
-
-        // 11,999 silent frames must NOT confirm, whatever the chunking.
-        foreach (int shape in chunkShapes) {
-          int confirms, resumes, confirmAt, resumeAt;
-          ClassifyStream(activeBefore, SquelchProfile.ConfirmFrames - 1, activeAfter, shape,
-            out confirms, out resumes, out confirmAt, out resumeAt);
-          if (confirms != 0)
-            throw new Exception("11,999 silent frames must remain qualifying, not confirm");
-        }
-
-        // The 12,000th silent frame confirms exactly once, at the same absolute frame index
-        // for every chunking, and resume lands on the first active frame after it.
-        int expectConfirm = activeBefore + SquelchProfile.ConfirmFrames - 1;
-        int expectResume = activeBefore + SquelchProfile.ConfirmFrames;
-        foreach (int shape in chunkShapes) {
-          int confirms, resumes, confirmAt, resumeAt;
-          ClassifyStream(activeBefore, SquelchProfile.ConfirmFrames, activeAfter, shape,
-            out confirms, out resumes, out confirmAt, out resumeAt);
-          if (confirms != 1)
-            throw new Exception("frame 12,000 must confirm exactly once, got " + confirms);
-          if (confirmAt != expectConfirm)
-            throw new Exception("confirmation landed on frame " + confirmAt + ", expected " +
-              expectConfirm + " (chunk shape " + shape + ") - read shape must not move it");
-          if (resumes != 1 || resumeAt != expectResume)
-            throw new Exception("resume must land exactly on the first active frame after silence");
-        }
-
-        // A silent run broken by one active frame must restart, never accumulate.
-        {
-          var c = new SourceClassifier();
-          var spans = new SourceSpan[64];
-          byte[] half = BuildStream(0, SquelchProfile.ConfirmFrames / 2, 1);   // silence then 1 active
-          c.Scan(half, 0, half.Length, spans);
-          if (c.Confirmed) throw new Exception("half a qualifying run must not confirm");
-          if (c.SilentRun != 0) throw new Exception("an active frame must reset the silent run");
-          byte[] second = BuildStream(0, SquelchProfile.ConfirmFrames / 2, 0);
-          c.Scan(second, 0, second.Length, spans);
-          if (c.Confirmed)
-            throw new Exception("two half-runs split by program must not add up to a confirmation");
-        }
-
-        // Confirmed silence is discarded, not inserted: a heartbeat must never become program.
-        {
-          var c = new SourceClassifier();
-          var spans = new SourceSpan[64];
-          byte[] tail = BuildStream(0, SquelchProfile.ConfirmFrames + 480, 0);
-          int n = c.Scan(tail, 0, tail.Length, spans);
-          if (!c.Confirmed) throw new Exception("a full qualifying tail must confirm");
-          bool sawDiscard = false;
-          for (int i = 0; i < n; i++) {
-            if (spans[i].Edge == SourceEdge.Confirmed && !spans[i].Insert)
-              throw new Exception("the threshold frame is media and must still be inserted");
-            if (!spans[i].Insert) { sawDiscard = true; if (spans[i].PaysDebt)
-              throw new Exception("confirmed silence must not pay down arrival debt"); }
-          }
-          if (!sawDiscard) throw new Exception("silence past the threshold must be discarded");
-        }
+        var pol = new ArrivalPolicy(); var cls = new SourceClassifier();
+        var sp = new SourceSpan[64];
+        long t = Stopwatch.GetTimestamp();
+        byte[] program = BuildStream(480, 0, 0);
+        DriveRead(pol, cls, sp, t, program, 0, program.Length);          // establish continuity
+        t += (long)(0.100 * perSec);                                     // a 100 ms stall = 4,800 frames
+        byte[] quiet = BuildStream(0, 480, 0);                           // answered by silence
+        DriveRead(pol, cls, sp, t, quiet, 0, quiet.Length);
+        pol.Recompute(t, Audio.Frames(10), false);
+        pol.AdoptArmed(Audio.Frames(Audio.MaxPrebufferMs), true);
+        if (pol.PrebufferMs <= Audio.MinPrebufferMs)
+          throw new Exception("an unconfirmed gap must be charged even when silence answers it");
+        // ...and those silent frames are transmitted media, so they PAY THE CHARGE DOWN. A
+        // 300 ms gap owes ~14,400 frames; 480 silent frames repay 10 ms of it and the rest must
+        // still be outstanding, so deliver enough to clear it and require that it clears.
+        double owedAfterFirst = pol.OutstandingDebtMs;
+        if (owedAfterFirst < 80)
+          throw new Exception("a 100 ms gap must leave a debt carry, got " + owedAfterFirst);
+        // Stay under the confirmation threshold: confirming would zero the carry outright and
+        // the check below could not tell payment from suspension.
+        byte[] payer = BuildStream(0, 5000, 0);
+        DriveRead(pol, cls, sp, t, payer, 0, payer.Length);
+        if (cls.Confirmed)
+          throw new Exception("the R7 fixture must stay unconfirmed, else SuspendDebt zeroes the carry");
+        if (pol.OutstandingDebtMs > 1.0)
+          throw new Exception("unconfirmed silent frames are media and must pay the debt down, " +
+            "still owing " + pol.OutstandingDebtMs);
       }
 
-      // The measurement handoff that removes the ArrivalPolicy race. The quantum may be
-      // overwritten between reads, but a dropped underrun would hide a real starvation from the
-      // only path that raises the target for one -- so it must accumulate across publishes and
-      // clear exactly once, on the take.
-      var ex = new PolicyExchange();
-      int exQ; bool exU;
-      if (ex.TakeMeasurement(out exQ, out exU))
-        throw new Exception("an empty exchange must report no pending measurement");
-      ex.PublishMeasurement(480, false);
-      ex.PublishMeasurement(512, true);      // the starvation
-      ex.PublishMeasurement(480, false);     // a later clean second must not erase it
-      if (!ex.TakeMeasurement(out exQ, out exU))
-        throw new Exception("a published measurement must be pending");
-      if (exQ != 480) throw new Exception("the render quantum must be latest-wins");
-      if (!exU) throw new Exception("an underrun must survive a later clean publish (raise evidence)");
-      if (ex.TakeMeasurement(out exQ, out exU))
-        throw new Exception("a consumed measurement must not be pending again");
-      ex.PublishMeasurement(480, false);
-      ex.TakeMeasurement(out exQ, out exU);
-      if (exU) throw new Exception("an underrun must clear on the take, not be counted twice");
-
-      // A trim taken while the endpoint is down is attributed to the outage, so a device
-      // problem can never again be counted as the network delivering late.
-      var outage = Primed(Audio.Frames(100));
-      outage.PublishTarget(Audio.MinPrebufferMs);
-      outage.BeginOutputOutage();
-      outage.AddFrames(MakeTone(Audio.Frames(400)), 0, Audio.Frames(400) * 4);
-      outage.EndOutputOutage();
-      if (outage.FreshnessTrimCount == 0)
-        throw new Exception("a stale backlog must still be trimmed during an outage");
-      if (outage.FreshnessTrimTransitionCount != outage.FreshnessTrimCount)
-        throw new Exception("a trim during an output transition must be attributed to the transition");
-
-      // A silent gap must hand back latency the measurement no longer justifies, at once.
-      // Crawling down at 5 ms per 10 s through a gap where nothing is playing kept ~200 ms
-      // of dead latency in the field.
-      var drop = new ArrivalPolicy();
-      long d0 = Stopwatch.GetTimestamp(), tt = d0;
-      for (int i = 0; i < 150; i++) {                    // bursty: 100 ms deliveries
-        tt = d0 + (long)(i * 0.100 * perSec);
-        drop.OnRead(tt, 19200, 3000, 1.0);
-        drop.Recompute(tt, Audio.Frames(10), false);
+      // R2: silence shorter than the confirmation threshold, then a stall, then program. The
+      // stall must be charged. This is the defect the whole phase exists to remove -- one
+      // silent block used to forgive it.
+      for (int blocks = 1; blocks <= 11; blocks++) {
+        var pol = new ArrivalPolicy(); var cls = new SourceClassifier();
+        var sp = new SourceSpan[64];
+        long t = Stopwatch.GetTimestamp();
+        byte[] program = BuildStream(1008, 0, 0);
+        DriveRead(pol, cls, sp, t, program, 0, program.Length);
+        byte[] shortQuiet = BuildStream(0, blocks * 1008, 0);            // 1..11 ordinary blocks
+        t += (long)(0.021 * perSec);
+        DriveRead(pol, cls, sp, t, shortQuiet, 0, shortQuiet.Length);
+        if (cls.Confirmed)
+          throw new Exception("under 12,000 silent frames must not confirm (" + blocks + " blocks)");
+        t += (long)(0.600 * perSec);                                     // the stall
+        byte[] resumed = BuildStream(1008, 0, 0);
+        DriveRead(pol, cls, sp, t, resumed, 0, resumed.Length);
+        pol.Recompute(t, Audio.Frames(10), false);
+        pol.AdoptArmed(Audio.Frames(Audio.MaxPrebufferMs), true);
+        if (pol.PrebufferMs <= Audio.MinPrebufferMs)
+          throw new Exception("a stall after " + blocks + " silent block(s) must be charged");
       }
-      drop.AdoptArmed(Audio.Frames(Audio.MaxPrebufferMs), true);
-      int raised = drop.PrebufferMs;
-      if (raised <= Audio.MinPrebufferMs) throw new Exception("a bursty path must raise the target");
-      long baseT = tt;
-      for (int i = 1; i <= 2000; i++) {                  // 42 s clean: flushes the 30 s window,
-        tt = baseT + (long)(i * 0.021 * perSec);         // but is short of the 60 s lowering hold
-        drop.OnRead(tt, 4032, 3000, 1.0);
-        drop.Recompute(tt, Audio.Frames(10), false);
-      }
-      if (drop.PrebufferMs != raised)
-        throw new Exception("the slow lowering hold must not have fired yet - test would prove nothing");
-      for (int i = 1; i <= 4; i++) drop.OnRead(tt + (long)(i * 2.0 * perSec), 4032, 0, 1.0);
-      if (!drop.Idle) throw new Exception("keepalives must enter idle");
-      drop.ApplyIdleTarget(Audio.Frames(10));
-      if (drop.PrebufferMs >= raised)
-        throw new Exception("an idle gap must return the latency the measurement no longer justifies");
 
-      // A degrading path arms a raise that occupancy will never reach by itself, because
-      // the ring is starving precisely when the bigger buffer is needed. Forced adoption
-      // -- what a hard rebuffer performs -- must take it regardless of occupancy. Omitting
-      // that adoption point left the receiver measuring a need it could not act on, and it
-      // thrashed through 14 rebuffers in 22 s with the raise sitting armed.
-      var stuck = new ArrivalPolicy();
-      long s0 = Stopwatch.GetTimestamp(), st = s0;
-      for (int i = 0; i < 60; i++) {
-        st = s0 + (long)(i * 0.200 * perSec);        // 200 ms deliveries: badly bursty
-        stuck.OnRead(st, 38400, 3000, 1.0);
-        stuck.Recompute(st, Audio.Frames(10), false);
+      // R3: the gap verdict is latched before the read. 11,999 silent frames, a 600 ms stall,
+      // then a read whose FIRST frame crosses the threshold -- the stall began unconfirmed and
+      // must be charged, however the returning bytes classify.
+      {
+        var pol = new ArrivalPolicy(); var cls = new SourceClassifier();
+        var sp = new SourceSpan[64];
+        long t = Stopwatch.GetTimestamp();
+        byte[] almost = BuildStream(0, SquelchProfile.ConfirmFrames - 1, 0);
+        DriveRead(pol, cls, sp, t, almost, 0, almost.Length);
+        if (cls.Confirmed) throw new Exception("11,999 frames must not confirm");
+        t += (long)(0.600 * perSec);
+        byte[] crossing = BuildStream(0, 1, 480);      // threshold frame, then program
+        DriveRead(pol, cls, sp, t, crossing, 0, crossing.Length);
+        pol.Recompute(t, Audio.Frames(10), false);
+        pol.AdoptArmed(Audio.Frames(Audio.MaxPrebufferMs), true);
+        if (pol.PrebufferMs <= Audio.MinPrebufferMs)
+          throw new Exception("a gap that began unconfirmed must be charged even if the read that closes it confirms");
       }
-      int floorTarget = stuck.PrebufferMs;
-      if (!stuck.AdoptArmed(1, true))
-        throw new Exception("forced adoption must take an armed raise regardless of occupancy");
-      if (stuck.PrebufferMs <= floorTarget)
-        throw new Exception("adopting the armed raise must actually raise the target");
+
+      // R4: once confirmed, silence of ANY length is free. A cap would reintroduce the defect
+      // for exactly the long pauses the mechanism exists to handle.
+      {
+        var pol = new ArrivalPolicy(); var cls = new SourceClassifier();
+        var sp = new SourceSpan[64];
+        long t = Stopwatch.GetTimestamp();
+        byte[] tail = BuildStream(480, SquelchProfile.ConfirmFrames, 0);
+        DriveRead(pol, cls, sp, t, tail, 0, tail.Length);
+        if (!cls.Confirmed) throw new Exception("a full qualifying tail must confirm");
+        int afterConfirm = pol.PrebufferMs;
+        double[] gaps = new double[] { 0.5, 2.5, 10.0 };
+        foreach (double g in gaps) {
+          t += (long)(g * perSec);
+          byte[] beat = BuildStream(0, 64, 0);                            // a heartbeat
+          DriveRead(pol, cls, sp, t, beat, 0, beat.Length);
+        }
+        t += (long)(0.021 * perSec);
+        byte[] back = BuildStream(480, 0, 0);
+        DriveRead(pol, cls, sp, t, back, 0, back.Length);
+        pol.Recompute(t, Audio.Frames(10), false);
+        pol.AdoptArmed(Audio.Frames(Audio.MaxPrebufferMs), true);
+        if (pol.PrebufferMs > afterConfirm)
+          throw new Exception("confirmed silence of any length must not become arrival debt");
+        if (pol.DebtEpoch == 0) throw new Exception("resuming must open a new debt epoch");
+      }
+
+      // P2 / P4: heartbeats are idempotent, and confirmed silence must not manufacture stable
+      // time. Sixty seconds of it must not walk the target down on its own.
+      {
+        var pol = new ArrivalPolicy(); var cls = new SourceClassifier();
+        var sp = new SourceSpan[64];
+        long t = Stopwatch.GetTimestamp();
+        // Drive the target well above the floor first, or lowering is impossible and the check
+        // below cannot fail however the freeze behaves.
+        byte[] burstBlock = BuildStream(9600, 0, 0);
+        for (int i = 0; i < 60; i++) {
+          t += (long)(0.200 * perSec);
+          DriveRead(pol, cls, sp, t, burstBlock, 0, burstBlock.Length);
+          pol.Recompute(t, Audio.Frames(10), false);
+        }
+        pol.AdoptArmed(Audio.Frames(Audio.MaxPrebufferMs), true);
+        int raised = pol.PrebufferMs;
+        if (raised <= Audio.MinPrebufferMs + HysteresisForTest)
+          throw new Exception("the P4 fixture must raise the target, else the freeze check is vacuous");
+        byte[] tail = BuildStream(480, SquelchProfile.ConfirmFrames, 0);
+        t += (long)(0.021 * perSec);
+        DriveRead(pol, cls, sp, t, tail, 0, tail.Length);
+        long entersAfterFirst = pol.SquelchEnterCount;
+        if (entersAfterFirst != 1) throw new Exception("confirmation must count exactly one enter");
+        for (int i = 0; i < 30; i++) {                                    // 60 s of heartbeats
+          t += (long)(2.0 * perSec);
+          byte[] beat = BuildStream(0, 64, 0);
+          DriveRead(pol, cls, sp, t, beat, 0, beat.Length);
+          pol.Recompute(t, Audio.Frames(10), false);
+        }
+        if (pol.SquelchEnterCount != entersAfterFirst)
+          throw new Exception("heartbeats must not re-enter confirmed squelch");
+        if (pol.LowerCount != 0)
+          throw new Exception("confirmed silence must not lower the target on its own, lowered " +
+            pol.LowerCount + " time(s)");
+
+        // The load-bearing part: 60 s of silence must not have satisfied the lowering hold. On
+        // resume the path is clean, so the warranted target drops -- but the hold has to be
+        // earned by ACTIVE time. Feed a few clean seconds and require that no lowering has yet
+        // fired; without the resume-time shift the silent minute would have paid for it.
+        // Feed ~35 s of clean program: long enough to flush the 30-entry structural window so
+        // the warranted target genuinely drops (otherwise no lowering could fire however the
+        // hold behaves, and this check would be decorative), but well short of the 60 s hold.
+        t += (long)(0.021 * perSec);
+        byte[] clean = BuildStream(1008, 0, 0);
+        for (int i = 0; i < 1667; i++) {
+          t += (long)(0.021 * perSec);
+          DriveRead(pol, cls, sp, t, clean, 0, clean.Length);
+          pol.Recompute(t, Audio.Frames(10), false);
+        }
+        if (pol.WarrantedForTest(Audio.Frames(10)) >= raised - HysteresisForTest)
+          throw new Exception("the P4 fixture must leave the warranted target lowerable, else " +
+            "the hold check below is vacuous");
+        if (pol.LowerCount != 0)
+          throw new Exception("silent wall time must not count toward the 60 s lowering hold: " +
+            "lowered " + pol.LowerCount + " time(s) after only ~35 s of active time");
+      }
+
+      // P1: confirmation ends debt continuity without deleting the evidence. A stall in the
+      // second before the source went quiet must still be visible to the call that decides how
+      // far the target may drop.
+      {
+        var pol = new ArrivalPolicy(); var cls = new SourceClassifier();
+        var sp = new SourceSpan[64];
+        long t = Stopwatch.GetTimestamp();
+        byte[] program = BuildStream(1008, 0, 0);
+        DriveRead(pol, cls, sp, t, program, 0, program.Length);
+        t += (long)(0.300 * perSec);                                      // a real stall
+        byte[] more = BuildStream(1008, 0, 0);
+        DriveRead(pol, cls, sp, t, more, 0, more.Length);
+        double debtBefore = pol.PublishedDebtMs(Audio.Frames(10));
+        if (debtBefore < 100)
+          throw new Exception("a 300 ms stall must register as debt before confirmation");
+        t += (long)(0.021 * perSec);
+        byte[] tail = BuildStream(0, SquelchProfile.ConfirmFrames, 0);
+        DriveRead(pol, cls, sp, t, tail, 0, tail.Length);
+        if (!cls.Confirmed) throw new Exception("the tail must confirm");
+        double debtAfter = pol.PublishedDebtMs(Audio.Frames(10));
+        if (debtAfter < debtBefore * 0.9)
+          throw new Exception("confirmation must not erase the measured stall that preceded it");
+      }
+
+      // Teeth for the whole group: a clean steady feed must NOT be taxed, or every check above
+      // would pass on a policy that simply always raises.
+      {
+        var pol = new ArrivalPolicy(); var cls = new SourceClassifier();
+        var sp = new SourceSpan[64];
+        long t = Stopwatch.GetTimestamp();
+        byte[] block = BuildStream(1008, 0, 0);                           // 21 ms of program
+        for (int i = 0; i < 200; i++) {
+          t += (long)(0.021 * perSec);
+          DriveRead(pol, cls, sp, t, block, 0, block.Length);
+          pol.Recompute(t, Audio.Frames(10), false);
+        }
+        pol.AdoptArmed(Audio.Frames(Audio.MaxPrebufferMs), true);
+        if (pol.PrebufferMs > Audio.MinPrebufferMs)
+          throw new Exception("a clean steady feed must stay at the floor, not inherit a tax");
+      }
+
+      // A degrading path arms a raise that occupancy will never reach by itself, because the
+      // ring is starving precisely when the bigger buffer is needed. Forced adoption -- what a
+      // hard rebuffer performs -- must take it regardless of occupancy.
+      {
+        var stuck = new ArrivalPolicy(); var cls = new SourceClassifier();
+        var sp = new SourceSpan[64];
+        long st = Stopwatch.GetTimestamp();
+        byte[] burstBlock = BuildStream(9600, 0, 0);                      // 200 ms deliveries
+        for (int i = 0; i < 60; i++) {
+          st += (long)(0.200 * perSec);
+          DriveRead(stuck, cls, sp, st, burstBlock, 0, burstBlock.Length);
+          stuck.Recompute(st, Audio.Frames(10), false);
+        }
+        int floorTarget = stuck.PrebufferMs;
+        if (!stuck.AdoptArmed(1, true))
+          throw new Exception("forced adoption must take an armed raise regardless of occupancy");
+        if (stuck.PrebufferMs <= floorTarget)
+          throw new Exception("adopting the armed raise must actually raise the target");
+      }
 
       // Freshness trim bounds latency without the old occupancy-only reset.
       var trim = new AdaptivePlayout();
