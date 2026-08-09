@@ -21,16 +21,71 @@ namespace AudioBridge {
   class Play : IMMNotificationClient {
     static readonly MMDeviceEnumerator en = new MMDeviceEnumerator();
     static Play notifier;                 // keep callback rooted (not GC'd)
-    static volatile bool deviceChanged;
     static readonly WaveFormat SourceFmt = new WaveFormat(48000, 16, 2);
     static float gGain = 1.0f;             // playback gain 0.0-1.0 (arg 3), applied to PCM
 
-    public void OnDefaultDeviceChanged(DataFlow flow, Role role, string id) {
-      if (flow == DataFlow.Render) deviceChanged = true;
+    // ---- output reconciliation --------------------------------------------
+    // This replaced a single `deviceChanged` bool that ANY render default change (for any
+    // role), ANY endpoint going non-active, ANY removal, and the player's own PlaybackStopped
+    // all set. The last of those closed a loop: a deliberate teardown raises PlaybackStopped,
+    // which re-armed the flag that caused the teardown. The field log shows the result --
+    // eight output generations in ~13 s, and every freshness trim in the post-fix window sits
+    // inside that burst, discarding 1,534.5 ms of audio that had already arrived.
+    //
+    // The replacement records what was actually notified, matches it against the endpoint we
+    // are really bound to, and re-reads the desired default before acting, so a notification
+    // that changes nothing costs nothing.
+    static volatile string activeEndpointId;   // endpoint the live chain is bound to
+    static volatile bool reconcileRequested;
+    static volatile string lastNotify = "none";
+    static long notifyAccepted, notifyIgnored, reconcileNoops;
+
+    static void RequestReconcile(string kind, string id) {
+      lastNotify = kind;
+      reconcileRequested = true;
+      Interlocked.Increment(ref notifyAccepted);
+      Console.Error.WriteLine("event=output_notify accepted=1 kind=" + kind + " id=" + (id ?? ""));
     }
-    public void OnDeviceStateChanged(string id, DeviceState s) { if (s != DeviceState.Active) deviceChanged = true; }
-    public void OnDeviceAdded(string id) {}
-    public void OnDeviceRemoved(string id) { deviceChanged = true; }
+    static void IgnoreNotify(string kind, string id) {
+      Interlocked.Increment(ref notifyIgnored);
+      Console.Error.WriteLine("event=output_notify accepted=0 kind=" + kind + " id=" + (id ?? ""));
+    }
+    static bool IsActiveEndpoint(string id) {
+      string a = activeEndpointId;
+      return a != null && id != null && a == id;
+    }
+    // DesiredEndpointId re-reads the endpoint OpenDefault would select right now. Comparing it
+    // against the live one is what makes reconciliation idempotent, and it coalesces a burst of
+    // notifications into a single decision for free.
+    static string DesiredEndpointId() {
+      try {
+        var d = en.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+        string id = d.ID;
+        try { d.Dispose(); } catch {}
+        return id;
+      } catch { return null; }
+    }
+    // ShouldReconcileOnStop is the PlaybackStopped guard, factored out so the self-test can
+    // exercise the exact decision that produced the storm.
+    static bool ShouldReconcileOnStop(OutputChain c) { return c != null && !c.Retired; }
+
+    // Windows raises OnDefaultDeviceChanged once PER ROLE, so following every role turned one
+    // device switch into three reopen requests. OpenDefault selects Render/Multimedia; that is
+    // the only pair that can change which endpoint we should be on.
+    public void OnDefaultDeviceChanged(DataFlow flow, Role role, string id) {
+      if (flow == DataFlow.Render && role == Role.Multimedia) RequestReconcile("default_changed", id);
+      else IgnoreNotify("default_changed_other", id);
+    }
+    // Only the endpoint we are actually rendering to matters. Reacting to every endpoint in the
+    // system meant an unrelated device going idle tore down healthy playback.
+    public void OnDeviceStateChanged(string id, DeviceState s) {
+      if (s != DeviceState.Active && IsActiveEndpoint(id)) RequestReconcile("state_changed", id);
+      else IgnoreNotify("state_changed_other", id);
+    }
+    public void OnDeviceAdded(string id) { IgnoreNotify("added", id); }
+    public void OnDeviceRemoved(string id) {
+      if (IsActiveEndpoint(id)) RequestReconcile("removed", id); else IgnoreNotify("removed_other", id);
+    }
     public void OnPropertyValueChanged(string id, PropertyKey k) {}
 
     [STAThread]
@@ -457,6 +512,10 @@ namespace AudioBridge {
       int targetGeneration;
 
       long overflowEvents, overflowFrames, freshnessTrims, freshnessTrimFrames;
+      // Trims taken while the output endpoint is down are a device event, not the network
+      // running late. Kept separate so a reopen storm can never again read as a transport fault.
+      long freshnessTrimsOutage, freshnessTrimFramesOutage;
+      bool outputOutage;
       long callbackGapEvents, requestedFrames, suppliedFrames, sourceFrames;
       long softUnderruns, softZeroFillFrames, hardRebuffers, rebufferFrames;
       long underrunsSinceRecompute;
@@ -473,6 +532,12 @@ namespace AudioBridge {
       public long SoftUnderrunCount { get { lock (gate) { return softUnderruns; } } }
       public long HardRebufferCount { get { lock (gate) { return hardRebuffers; } } }
       public long FreshnessTrimCount { get { lock (gate) { return freshnessTrims; } } }
+      public long FreshnessTrimOutageCount { get { lock (gate) { return freshnessTrimsOutage; } } }
+      // Bracket a deliberate endpoint teardown so any discard inside it is attributed to the
+      // outage. Both take the same lock the render callback uses, so the flag can never be
+      // observed half-set from the audio thread.
+      public void BeginOutputOutage() { lock (gate) { outputOutage = true; } }
+      public void EndOutputOutage() { lock (gate) { outputOutage = false; } }
 
       public AdaptivePlayout() {
         minOccupancy = maxOccupancy = 0;
@@ -590,6 +655,10 @@ namespace AudioBridge {
             if (fromRing + fromInput > 0) {
               freshnessTrims++;
               freshnessTrimFrames += fromRing + fromInput;
+              if (outputOutage) {
+                freshnessTrimsOutage++;
+                freshnessTrimFramesOutage += fromRing + fromInput;
+              }
               pendingDiscontinuity = true;
             }
           }
@@ -844,6 +913,7 @@ namespace AudioBridge {
         int occupancyMs, spanMs, writeBeforeMs, writeAfterMs, prebufMs, quantumMs, r50, r95, r99;
         long callbackGaps, requested, supplied, softs, softZeros, hards, hardFrames;
         long overflows, overflowedFrames, trims, trimmedFrames, playedSourceFrames;
+        long outageTrims, outageTrimFrames;
         bool rebuf, idleNow;
         lock (gate) {
           ratioPpm = (ratio - 1.0) * 1000000.0;
@@ -863,6 +933,8 @@ namespace AudioBridge {
           overflowedFrames = overflowFrames;
           trims = freshnessTrims;
           trimmedFrames = freshnessTrimFrames;
+          outageTrims = freshnessTrimsOutage;
+          outageTrimFrames = freshnessTrimFramesOutage;
           playedSourceFrames = sourceFrames;
           prebufMs = Audio.Ms(prebufferFrames);
           quantumMs = Audio.Ms(requestQuantumFrames);
@@ -887,7 +959,9 @@ namespace AudioBridge {
           "callback_gap_alert={32} occupancy_jump_alert={33} " +
           "render_req_p50_ms={34} render_req_p95_ms={35} render_req_p99_ms={36} " +
           "callback_gap_p50_ms={37:0.0} callback_gap_p95_ms={38:0.0} callback_gap_p99_ms={39:0.0} " +
-          "device_buffer_ms={40}",
+          "device_buffer_ms={40} " +
+          "freshness_trim_device_reopen={41} freshness_trim_device_reopen_ms={42:0.0} " +
+          "output_notify_accepted={43} output_notify_ignored={44} output_reconcile_noop={45}",
           rxBytes, rxDurationMs, maxReadGapMs, occupancyMs,
           writeBeforeMs, writeAfterMs, spanMs, callbackMaxGapMs, callbackGaps,
           quantumMs, prebufMs, requested, supplied,
@@ -898,7 +972,9 @@ namespace AudioBridge {
           generation, renderMode, endpoint == null ? "none" : endpoint.Replace(' ', '_'), state,
           rebuf ? 1 : 0, arrival,
           callbackMaxGapMs > 150.0 ? 1 : 0, spanMs > 100 ? 1 : 0,
-          r50, r95, r99, g50, g95, g99, deviceBufferMs);
+          r50, r95, r99, g50, g95, g99, deviceBufferMs,
+          outageTrims, outageTrimFrames * 1000.0 / SampleRate,
+          Interlocked.Read(ref notifyAccepted), Interlocked.Read(ref notifyIgnored), reconcileNoops);
       }
     }
 
@@ -955,7 +1031,13 @@ namespace AudioBridge {
       public WasapiOut Out;
       public string Mode = "unknown";
       public int LatencyMs;
+      // Retired marks a teardown WE chose. NAudio raises PlaybackStopped from the playback
+      // thread's finally block, so it can land after the reopen has already cleared the
+      // request flag; without this guard that late event re-armed reconciliation and the
+      // reopen fed itself.
+      public volatile bool Retired;
       public void Dispose() {
+        Retired = true;   // must precede Stop(): the handler races this
         try { if (Out != null) Out.Stop(); } catch {}
         try { if (Out != null) Out.Dispose(); } catch {}
         try { if (Resampler != null) Resampler.Dispose(); } catch {}
@@ -1003,17 +1085,21 @@ namespace AudioBridge {
         wo.Init(provider);
         mode = "polling_fallback";
       }
+      var chain = new OutputChain();
+      chain.Device = dev; chain.Resampler = null; chain.Out = wo;
+      chain.Mode = mode; chain.LatencyMs = latencyMs;
+      string boundId = dev.ID;   // captured: reading dev.ID after disposal can throw
       wo.PlaybackStopped += delegate(object s, StoppedEventArgs e) {
+        // A teardown we asked for raises this too. Treating that as a device change is what
+        // made the reopen re-arm the flag that caused it.
+        if (!ShouldReconcileOnStop(chain)) return;
         if (e.Exception != null) Console.Error.WriteLine("stopped: " + e.Exception.Message);
-        deviceChanged = true;
+        RequestReconcile("playback_stopped", boundId);
       };
       wo.Play();
       BindAndUnmute(dev);
       Console.Error.WriteLine("playing WASAPI shared, mode=" + mode + ", buffer_ms=" + latencyMs +
         ", state=" + wo.PlaybackState);
-      var chain = new OutputChain();
-      chain.Device = dev; chain.Resampler = null; chain.Out = wo;
-      chain.Mode = mode; chain.LatencyMs = latencyMs;
       // A new endpoint has its own period; request/gap history from the old one would
       // misdescribe it. The network-side reserve estimate is intentionally preserved.
       provider.BeginQuantumEpoch();
@@ -1075,6 +1161,8 @@ namespace AudioBridge {
       byte[] tmp = new byte[SourceFmt.AverageBytesPerSecond / 20]; // ~50ms
       var assembler = new FrameAssembler(tmp.Length);
       long intervalBytes = 0, lastRead = 0, lastHardRebuffer = 0;
+      long lastWatchdogTicks = 0;
+      long watchdogTicks = Stopwatch.Frequency * 5;   // endpoint-drift check, 5 s
       double maxReadGapMs = 0;
       int outputGeneration = 0;
       string endpoint = "none";
@@ -1162,17 +1250,54 @@ namespace AudioBridge {
           // that measurement produced. Never open into a squelched stream.
           if (chain == null && !policy.Idle && policy.ObservationSatisfied(readTicks) &&
               provider.BufferedFrames >= provider.PrebufferFrames) {
-            deviceChanged = false;
+            reconcileRequested = false;
             chain = OpenDefault(provider); // open AFTER prebuffer so first buffers are real audio
             outputGeneration++;
             endpoint = chain.Device.ID;
-          } else if (chain != null && (deviceChanged || chain.Out.PlaybackState == PlaybackState.Stopped)) {
-            Console.Error.WriteLine("reopening output (device/session change)");
-            chain.Dispose();
-            deviceChanged = false;
-            chain = OpenDefault(provider);
-            outputGeneration++;
-            endpoint = chain.Device.ID;
+            activeEndpointId = endpoint;
+            reconcileRequested = false;    // discard anything our own open raised
+          } else if (chain != null) {
+            // Watchdog against over-filtering. If a notification we declined to act on did
+            // matter, the desired default and the endpoint we are on disagree, and this
+            // notices without needing the notification at all. Cheap because it is rate-limited.
+            if (readTicks - lastWatchdogTicks >= watchdogTicks) {
+              lastWatchdogTicks = readTicks;
+              string drift = DesiredEndpointId();
+              if (drift != null && activeEndpointId != null && drift != activeEndpointId)
+                RequestReconcile("watchdog_drift", drift);
+            }
+            bool stopped = chain.Out.PlaybackState == PlaybackState.Stopped;
+            if (reconcileRequested || stopped) {
+              reconcileRequested = false;
+              string desired = DesiredEndpointId();
+              // Idempotent: a notification that does not change which endpoint we should be on,
+              // against a player that is still running, is not a reason to interrupt audio.
+              // This is where a burst of notifications collapses into one decision.
+              if (!stopped && desired != null && desired == activeEndpointId) {
+                reconcileNoops++;
+                Console.Error.WriteLine("event=output_reconcile_noop reason=" + lastNotify +
+                  " endpoint=" + desired);
+              } else {
+                Console.Error.WriteLine("event=output_reopen reason=" +
+                  (stopped ? "player_stopped" : lastNotify) +
+                  " from=" + (activeEndpointId ?? "") + " to=" + (desired ?? "") +
+                  " generation=" + outputGeneration);
+                // Audio discarded while the endpoint is down is an output outage, not the
+                // network running late. Charging it to network freshness is what made a device
+                // problem read as a transport problem.
+                provider.BeginOutputOutage();
+                try {
+                  chain.Dispose();
+                  chain = OpenDefault(provider);
+                  outputGeneration++;
+                  endpoint = chain.Device.ID;
+                  activeEndpointId = endpoint;
+                } finally {
+                  provider.EndOutputOutage();
+                }
+                reconcileRequested = false;  // our own teardown/open must not re-trigger us
+              }
+            }
           }
         }
       } finally {
@@ -1342,6 +1467,60 @@ namespace AudioBridge {
       stall.AdoptArmed(Audio.Frames(Audio.MaxPrebufferMs), true);
       if (stall.PrebufferMs <= Audio.MinPrebufferMs)
         throw new Exception("a real stall must still raise the target");
+
+      // Device-notification filtering. The shipped version reopened the output on ANY render
+      // default change regardless of role (Windows raises one per role), on ANY endpoint going
+      // non-active, and on ANY removal. The field log shows eight output generations in ~13 s
+      // and every freshness trim of that run sitting inside the burst, discarding 1,534.5 ms of
+      // audio that had already arrived.
+      var nc = new Play();
+      activeEndpointId = "ACTIVE-ENDPOINT";
+      reconcileRequested = false;
+      nc.OnDefaultDeviceChanged(DataFlow.Render, Role.Console, "OTHER");
+      if (reconcileRequested) throw new Exception("a non-Multimedia role must not reopen the output");
+      nc.OnDefaultDeviceChanged(DataFlow.Capture, Role.Multimedia, "OTHER");
+      if (reconcileRequested) throw new Exception("a capture default change must not reopen the output");
+      nc.OnDeviceStateChanged("OTHER", DeviceState.Disabled);
+      if (reconcileRequested) throw new Exception("an unrelated endpoint going inactive must not reopen the output");
+      nc.OnDeviceRemoved("OTHER");
+      if (reconcileRequested) throw new Exception("removing an unrelated endpoint must not reopen the output");
+      nc.OnDeviceAdded("OTHER");
+      if (reconcileRequested) throw new Exception("adding an endpoint must not reopen the output");
+
+      // Teeth: the events that genuinely change which endpoint we belong on must still act,
+      // or the filter above would be indistinguishable from ignoring device changes entirely.
+      nc.OnDefaultDeviceChanged(DataFlow.Render, Role.Multimedia, "NEW-DEFAULT");
+      if (!reconcileRequested) throw new Exception("a render/multimedia default change must reconcile");
+      reconcileRequested = false;
+      nc.OnDeviceStateChanged("ACTIVE-ENDPOINT", DeviceState.Unplugged);
+      if (!reconcileRequested) throw new Exception("the active endpoint going inactive must reconcile");
+      reconcileRequested = false;
+      nc.OnDeviceRemoved("ACTIVE-ENDPOINT");
+      if (!reconcileRequested) throw new Exception("removing the active endpoint must reconcile");
+      reconcileRequested = false;
+
+      // The feedback loop itself: a teardown we chose raises PlaybackStopped, and treating that
+      // as a device change re-armed the reconciliation that caused it. Retired must suppress it,
+      // and only it -- an unexpected stop is still a real signal worth acting on.
+      var liveChain = new OutputChain();
+      if (!ShouldReconcileOnStop(liveChain))
+        throw new Exception("an unexpected playback stop must still reconcile");
+      liveChain.Retired = true;
+      if (ShouldReconcileOnStop(liveChain))
+        throw new Exception("our own teardown must not re-arm reconciliation (the reopen storm)");
+      activeEndpointId = null;
+
+      // A trim taken while the endpoint is down is attributed to the outage, so a device
+      // problem can never again be counted as the network delivering late.
+      var outage = Primed(Audio.Frames(100));
+      outage.PublishTarget(Audio.MinPrebufferMs);
+      outage.BeginOutputOutage();
+      outage.AddFrames(MakeTone(Audio.Frames(400)), 0, Audio.Frames(400) * 4);
+      outage.EndOutputOutage();
+      if (outage.FreshnessTrimCount == 0)
+        throw new Exception("a stale backlog must still be trimmed during an outage");
+      if (outage.FreshnessTrimOutageCount != outage.FreshnessTrimCount)
+        throw new Exception("a trim during an output outage must be attributed to the outage");
 
       // A silent gap must hand back latency the measurement no longer justifies, at once.
       // Crawling down at 5 ms per 10 s through a gap where nothing is playing kept ~200 ms
