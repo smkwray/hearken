@@ -73,7 +73,7 @@ required_sites=(
   "exchange.TakeMeasurement"                  # telemetry -> network handoff
   "exchange.PublishMeasurement"               # the other half of it
   "policy.ObservationSatisfied(readTicks)"    # the cold-open gate
-  "OnConfirmedEntry(c.Provider"                # the confirmed-entry branch, CALLED from ProcessRead
+  "BuildConfirmedEntry(c.Provider"             # confirmation appended to the BATCH, not the live provider
   "ForceTargetBeforeColdOpen(provider"        # forced adoption before the first open
 )
 for site in "${required_sites[@]}"; do
