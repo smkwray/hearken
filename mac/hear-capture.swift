@@ -361,7 +361,13 @@ while true {
     if st != noErr { FileHandle.standardError.write("set device \(st)\n".data(using: .utf8)!) }
     // Capture quantum, GUI-tunable via BRIDGE_AQ_BUF_BYTES (default 4096 B = ~21 ms).
     let bufBytes = UInt32(ProcessInfo.processInfo.environment["BRIDGE_AQ_BUF_BYTES"] ?? "4096") ?? 4096
-    for _ in 0..<6 {
+    // Hold a fixed ~125 ms of capture depth whatever the quantum is. A hardcoded count of
+    // 6 meant halving the quantum to buy latency also halved the headroom that absorbs a
+    // callback scheduling delay, and samples lost at the SOURCE are audible behind a
+    // receiver buffer of any size. At the 21 ms default this still evaluates to 6.
+    let captureDepthBytes = 48000 * 4 * 125 / 1000
+    let bufCount = max(6, (captureDepthBytes + Int(bufBytes) - 1) / Int(bufBytes))
+    for _ in 0..<bufCount {
         var buf: AudioQueueBufferRef?
         AudioQueueAllocateBuffer(queue!, bufBytes, &buf)
         if let buf = buf { AudioQueueEnqueueBuffer(queue!, buf, 0, nil) }

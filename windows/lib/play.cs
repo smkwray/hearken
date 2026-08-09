@@ -117,7 +117,11 @@ namespace AudioBridge {
       const int StructuralWindow = 30;   // one-second peaks feeding the p90
       const int SpikeWindow = 10;        // one-second peaks feeding the repeated-spike rule
       const double IdleGapMs = 500.0;    // no active-rate media for this long => suspect squelch
-      const int KeepaliveBytes = 4032;   // one 21 ms AudioQueue buffer (the squelch heartbeat)
+      // Upper bound on a squelch heartbeat block, not an exact size: the sender's capture
+      // quantum is configurable (3-30 ms), so a heartbeat is anything from 576 B up. 4032 B
+      // is the largest quantum's block; a bigger silent read is program-sized silence and
+      // classifying it as a heartbeat is only ever a missed idle, never a false one.
+      const int KeepaliveBytes = 4032;
       // Must be >= the sender's squelchThreshold (hear-capture.swift, default 16), or a
       // keepalive reads as program and idle never fires. v1 has no way to negotiate it;
       // protocol v2's SILENCE_START replaces this inference with a stated fact.
@@ -143,8 +147,9 @@ namespace AudioBridge {
       int reserveMs = Audio.MinReserveMs;
       int prebufferMs = Audio.MinPrebufferMs;
       int armedPrebufferMs;                 // raised target waiting for a safe adoption point
-      bool idle, started;
-      long idleEnterCount, idleExitCount, raiseCount, lowerCount, armedExpiredCount;
+      bool idle, started, lastReadSilent;
+      long idleEnterCount, idleExitCount, raiseCount, lowerCount, armedExpiredCount, squelchGapCount;
+      double squelchGapMaxMs;
       string targetReason = "init";
 
       public bool Idle { get { return idle; } }
@@ -176,6 +181,11 @@ namespace AudioBridge {
       public void OnRead(long nowTicks, int bytes, short peak, double consumeRatio) {
         bool silent = peak <= SilencePeak;
         bool keepalive = silent && bytes <= KeepaliveBytes;
+
+        // Whether the PRECEDING read was silent decides how to read the gap in front of
+        // this one, so latch it before any of the early returns below.
+        bool afterSilence = lastReadSilent;
+        lastReadSilent = silent;
 
         // Squelch detection. A keepalive-sized silent block arriving after a gap means
         // the source stopped sending program, not that the link fell behind.
@@ -212,19 +222,36 @@ namespace AudioBridge {
         activeReads++;
         int receivedFrames = bytes / Audio.FrameBytes;
         if (lastReadTicks != 0) {
-          // Expected arrival rate is the rate the ring is actually drained at, which
-          // is the nominal rate scaled by the clock-correction ratio.
-          double rate = Audio.SampleRate * (consumeRatio > 0 ? consumeRatio : 1.0);
-          double dueFrames = (nowTicks - lastReadTicks) / ticksPerSecond * rate;
-          double debtBeforeRead = outstandingDebtFrames + dueFrames;
-          if (debtBeforeRead < 0) debtBeforeRead = 0;
-          // A gap wider than the largest buffer we would ever hold is a stall, not
-          // jitter. One rebuffer answers it; proposing an unreachable target does not.
-          double cap = Audio.Frames(Audio.MaxPrebufferMs);
-          if (debtBeforeRead > cap) debtBeforeRead = cap;
-          if (debtBeforeRead > oneSecondPeakFrames) oneSecondPeakFrames = debtBeforeRead;
-          outstandingDebtFrames = debtBeforeRead - receivedFrames;
-          if (outstandingDebtFrames < 0) outstandingDebtFrames = 0;
+          if (afterSilence) {
+            // A gap that opened after a SILENT read is source squelch, not lateness. The
+            // sender stops transmitting only once it has already sent squelchHold (0.25 s)
+            // of silence, so by construction no media was owed across the gap. Charging it
+            // is what pinned the target at the ceiling: a pause shorter than the sender's
+            // 2 s keepalive puts no bytes on the wire at all, yet never reaches the
+            // keepalive-gap test that declares idle, so the whole pause was billed as
+            // arrival debt. Speech, video and gaps between tracks are made of such pauses.
+            // A genuine stall interrupts PROGRAM audio and is still charged in full; the
+            // residual exposure is a stall starting inside the 0.25 s hold, and that
+            // surfaces as an underrun, which raises the target on its own evidence.
+            squelchGapCount++;
+            double gapMs = (nowTicks - lastReadTicks) * 1000.0 / ticksPerSecond;
+            if (gapMs > squelchGapMaxMs) squelchGapMaxMs = gapMs;
+            outstandingDebtFrames = 0;   // what ResetEpoch already gives a declared idle
+          } else {
+            // Expected arrival rate is the rate the ring is actually drained at, which
+            // is the nominal rate scaled by the clock-correction ratio.
+            double rate = Audio.SampleRate * (consumeRatio > 0 ? consumeRatio : 1.0);
+            double dueFrames = (nowTicks - lastReadTicks) / ticksPerSecond * rate;
+            double debtBeforeRead = outstandingDebtFrames + dueFrames;
+            if (debtBeforeRead < 0) debtBeforeRead = 0;
+            // A gap wider than the largest buffer we would ever hold is a stall, not
+            // jitter. One rebuffer answers it; proposing an unreachable target does not.
+            double cap = Audio.Frames(Audio.MaxPrebufferMs);
+            if (debtBeforeRead > cap) debtBeforeRead = cap;
+            if (debtBeforeRead > oneSecondPeakFrames) oneSecondPeakFrames = debtBeforeRead;
+            outstandingDebtFrames = debtBeforeRead - receivedFrames;
+            if (outstandingDebtFrames < 0) outstandingDebtFrames = 0;
+          }
         }
         lastReadTicks = nowTicks;
         if (epochTicks == 0) epochTicks = nowTicks;
@@ -371,11 +398,13 @@ namespace AudioBridge {
           "arrival_debt_ms={0:0.0} arrival_debt_p50_ms={1:0.0} arrival_debt_p99_ms={2:0.0} " +
           "reserve_target_ms={3} prebuffer_target_ms={4} target_armed_ms={5} " +
           "target_raise={6} target_lower={7} target_armed_expired={8} target_reason={9} " +
-          "idle_enter={10} idle_exit={11} idle_resume_ms={12:0.0} idle={13}",
+          "idle_enter={10} idle_exit={11} idle_resume_ms={12:0.0} idle={13} " +
+          "squelch_gap={14} squelch_gap_max_ms={15:0.0}",
           publishedDebtMs, p50, p99,
           reserveMs, prebufferMs, armedPrebufferMs,
           raiseCount, lowerCount, armedExpiredCount, targetReason,
-          idleEnterCount, idleExitCount, lastIdleResumeMs, idle ? 1 : 0);
+          idleEnterCount, idleExitCount, lastIdleResumeMs, idle ? 1 : 0,
+          squelchGapCount, squelchGapMaxMs);
       }
     }
 
@@ -1263,6 +1292,49 @@ namespace AudioBridge {
       }
       if (clean.PrebufferMs > Audio.MinPrebufferMs)
         throw new Exception("a clean link must stay at the floor, not inherit a bursty path's target");
+
+      // Intermittent content on a clean link. A pause SHORTER than the sender's 2 s
+      // keepalive puts no bytes on the wire, so it never reaches the 500 ms keepalive-gap
+      // test that declares idle -- and the whole pause used to be billed as arrival debt.
+      // Measured on bmst->bzot: 18 h pinned at the 400 ms ceiling over wired Ethernet
+      // whose own jitter warrants 40 ms. Speech, video and gaps between tracks are made
+      // of exactly these pauses.
+      var speech = new ArrivalPolicy();
+      long p0 = Stopwatch.GetTimestamp(), pt = p0;
+      for (int phrase = 0; phrase < 15; phrase++) {
+        for (int i = 0; i < 95; i++) {                  // ~2 s of program at the 21 ms quantum
+          pt += (long)(0.021 * perSec);
+          speech.OnRead(pt, 4032, 3000, 1.0);
+          speech.Recompute(pt, Audio.Frames(10), false);
+        }
+        for (int i = 0; i < 12; i++) {                  // squelchHold: 0.25 s of silence sent
+          pt += (long)(0.021 * perSec);
+          speech.OnRead(pt, 4032, 0, 1.0);
+          speech.Recompute(pt, Audio.Frames(10), false);
+        }
+        pt += (long)(0.600 * perSec);                   // squelched: nothing on the wire at all
+      }
+      if (speech.Idle)
+        throw new Exception("a sub-keepalive pause must not reach idle, else this proves nothing");
+      speech.AdoptArmed(Audio.Frames(Audio.MaxPrebufferMs), true);   // cash in anything armed
+      if (speech.PrebufferMs > Audio.MinPrebufferMs)
+        throw new Exception("a short source pause must not be charged as arrival debt");
+
+      // Teeth: the same 600 ms gap opening after PROGRAM audio is a real stall, and must
+      // still raise. Excusing every gap would pass the check above and be worthless.
+      var stall = new ArrivalPolicy();
+      long q0 = Stopwatch.GetTimestamp(), qt = q0;
+      for (int phrase = 0; phrase < 15; phrase++) {
+        for (int i = 0; i < 95; i++) {
+          qt += (long)(0.021 * perSec);
+          stall.OnRead(qt, 4032, 3000, 1.0);
+          stall.Recompute(qt, Audio.Frames(10), false);
+        }
+        qt += (long)(0.600 * perSec);                   // no silent hold: the link just stopped
+      }
+      stall.AdoptArmed(Audio.Frames(Audio.MaxPrebufferMs), true);
+      if (stall.PrebufferMs <= Audio.MinPrebufferMs)
+        throw new Exception("a real stall must still raise the target");
 
       // A silent gap must hand back latency the measurement no longer justifies, at once.
       // Crawling down at 5 ms per 10 s through a gap where nothing is playing kept ~200 ms
