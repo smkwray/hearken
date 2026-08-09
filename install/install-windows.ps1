@@ -46,7 +46,11 @@ if (Test-Path $exe) {
   $action    = New-ScheduledTaskAction -Execute $exe
   $trigger   = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
   $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
-  $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Seconds 0)
+  # -Priority 6 = Normal. Task Scheduler defaults to 7, which maps to
+  # BELOW_NORMAL_PRIORITY_CLASS; only 4-6 map to Normal. A real-time audio path should not
+  # inherit a below-normal class from the fact that it was started by a logon task, and the
+  # spawned play.exe/capture.exe inherit whatever the supervisor gets.
+  $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Seconds 0) -Priority 6
   Register-ScheduledTask -TaskName Hearken -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
   Start-ScheduledTask -TaskName Hearken
   Write-Host "  registered + started 'Hearken' (runs the daemon headless at logon; tray icon)"
