@@ -195,13 +195,80 @@ func writeAll(_ fd: Int32, _ p: UnsafeRawPointer, _ len: Int) -> Bool {
 // The AudioQueue callback must NEVER block: a blocking write() during a network
 // hiccup stalls the callback, the (few) capture buffers overrun, and samples are
 // lost at the source — audible crackle no receiver-side buffer can hide. So the
-// callback only appends to this queue; a dedicated thread does the blocking I/O.
+// callback only copies into this queue; a dedicated thread does the blocking I/O.
 // On overflow (sustained stall) we drop the OLDEST audio, frame-aligned, so the
 // stream stays fresh rather than building latency.
+
+/// Fixed-capacity circular byte queue for the capture -> sender handoff.
+///
+/// It replaces a `Data` queue, which is forbidden on a capture callback: the first `append`
+/// allocates, a growing `append` reallocates, `removeFirst` moves every retained byte down, and
+/// once the sender thread holds a reference the copy-on-write copy lands on whichever thread
+/// writes next — the callback. Reserved capacity is a hope there, not a guarantee.
+///
+/// This owns ONE allocation, made when the global is first touched (forced before
+/// `AudioQueueStart`) and never repeated. `push` and `drain` are memcpy and integer arithmetic:
+/// no allocation, no growth, no object per frame.
+struct SendRing {
+    let capacity: Int
+    private let base: UnsafeMutableRawPointer
+    private var head = 0            // offset of the oldest queued byte
+    private(set) var count = 0      // bytes queued
+
+    init(capacity: Int) {
+        self.capacity = capacity
+        base = UnsafeMutableRawPointer.allocate(byteCount: capacity, alignment: 16)
+    }
+
+    var isEmpty: Bool { count == 0 }
+
+    mutating func reset() { head = 0; count = 0 }
+
+    /// Copy `len` bytes in, discarding the OLDEST bytes — frame-aligned — when they do not fit.
+    /// Returns the number of bytes discarded, which is exactly what the drop telemetry counts.
+    @discardableResult
+    mutating func push(_ p: UnsafeRawPointer, _ len: Int) -> Int {
+        let over = count + len - capacity
+        if over <= 0 { copyIn(p, len); return 0 }
+        // Frame-aligned: the raw profile has no resync, so a queue that began mid-frame would
+        // swap the channels for the rest of the connection.
+        let frame = SquelchProfile.frameBytes
+        let discard = (over + frame - 1) / frame * frame
+        let fromQueue = min(count, discard)
+        head = (head + fromQueue) % capacity
+        count -= fromQueue
+        // Reached only by a single buffer larger than the whole queue (BRIDGE_AQ_BUF_BYTES above
+        // the ceiling): keep its newest bytes, which is the same drop-oldest rule one step later.
+        let fromInput = discard - fromQueue
+        copyIn(p + fromInput, len - fromInput)
+        return discard
+    }
+
+    /// Copy the whole queue out to `dst` (which must have room for `capacity` bytes) and empty it.
+    /// The sender thread does this under the lock, then writes from `dst` with the lock released.
+    mutating func drain(into dst: UnsafeMutableRawPointer) -> Int {
+        let n = count
+        let first = min(n, capacity - head)
+        memcpy(dst, base + head, first)
+        if n > first { memcpy(dst + first, base, n - first) }
+        head = (head + n) % capacity
+        count = 0
+        return n
+    }
+
+    private mutating func copyIn(_ p: UnsafeRawPointer, _ len: Int) {
+        let tail = (head + count) % capacity
+        let first = min(len, capacity - tail)
+        memcpy(base + tail, p, first)
+        if len > first { memcpy(base, p + first, len - first) }
+        count += len
+    }
+}
+
 let sendCond = NSCondition()
-var sendPending = Data()
 var senderDead = false
 let sendPendingMax = 96 * 1024      // ~0.5s ceiling during a stall, then drop-oldest
+var sendRing = SendRing(capacity: sendPendingMax)
 var pendingSince = 0.0
 var captureFrames: UInt64 = 0
 var lastCallbackTime = 0.0
@@ -216,7 +283,7 @@ var senderDropGeneration: UInt64 = 0
 // Latest-wins copy of the squelch state, published under the queue lock. The state machine itself
 // belongs to the capture callback and must not be read from the telemetry thread.
 var senderSquelchPublished = SenderSquelchState()
-// Audio handed to writeAll but not yet written: it has left sendPending and is not
+// Audio handed to writeAll but not yet written: it has left the send ring and is not
 // on the wire. Published before the blocking write so a stalled write is visible
 // while it stalls, instead of only being counted after it finally returns.
 var inflightBytes = 0
@@ -229,10 +296,17 @@ var writesOver20: UInt64 = 0
 var writesOver100: UInt64 = 0
 var writesOver250: UInt64 = 0
 var effectiveSendBuffer = 0
+/// One drop event: fixed numbers, stored by the callback into a slot reserved at startup. Swift
+/// Arrays were wrong here for the same reason `Data` was wrong for the queue — a subscript store
+/// carries a copy-on-write branch that allocates, and static reachability from an audio callback is
+/// the defect, not whether the branch happens to be taken today.
+struct DropEvent { var bytes = 0; var ageMs = 0.0; var at = 0.0 }
 let dropEventCapacity = 128
-var dropEventBytes = [Int](repeating: 0, count: dropEventCapacity)
-var dropEventAgeMs = [Double](repeating: 0, count: dropEventCapacity)
-var dropEventTime = [Double](repeating: 0, count: dropEventCapacity)
+let dropEventRing: UnsafeMutablePointer<DropEvent> = {
+    let p = UnsafeMutablePointer<DropEvent>.allocate(capacity: dropEventCapacity)
+    p.initialize(repeating: DropEvent(), count: dropEventCapacity)
+    return p
+}()
 var dropEventRead = 0
 var dropEventWrite = 0
 var dropEventLost: UInt64 = 0
@@ -257,12 +331,10 @@ func publishCaptureMetrics(_ len: Int, _ now: Double) {
 func enqueueSend(_ p: UnsafeRawPointer, _ len: Int, _ now: Double) -> UInt64 {
     sendCond.lock()
     if !senderDead {
-        if sendPending.isEmpty { pendingSince = now }
-        let over = sendPending.count + len - sendPendingMax
-        if over > 0 {
-            let removed = (over + 3) / 4 * 4
+        if sendRing.isEmpty { pendingSince = now }
+        let removed = sendRing.push(p, len)   // frame-aligned drop-oldest into fixed storage
+        if removed > 0 {
             let ageMs = pendingSince > 0 ? (now - pendingSince) * 1000 : 0
-            sendPending.removeFirst(removed)  // frame-aligned drop-oldest
             senderDropGeneration &+= 1
             dropEvents += 1
             dropBytes += UInt64(removed)
@@ -271,14 +343,11 @@ func enqueueSend(_ p: UnsafeRawPointer, _ len: Int, _ now: Double) -> UInt64 {
             if next == dropEventRead {
                 dropEventLost += 1
             } else {
-                dropEventBytes[dropEventWrite] = removed
-                dropEventAgeMs[dropEventWrite] = ageMs
-                dropEventTime[dropEventWrite] = now
+                dropEventRing[dropEventWrite] = DropEvent(bytes: removed, ageMs: ageMs, at: now)
                 dropEventWrite = next
             }
         }
-        sendPending.append(UnsafeRawBufferPointer(start: p, count: len).bindMemory(to: UInt8.self))
-        if sendPending.count > pendingHighWater { pendingHighWater = sendPending.count }
+        if sendRing.count > pendingHighWater { pendingHighWater = sendRing.count }
         sendCond.signal()
     }
     let generation = senderDropGeneration
@@ -301,14 +370,12 @@ func emitDropEvents() {
             }
             return
         }
-        let bytes = dropEventBytes[dropEventRead]
-        let ageMs = dropEventAgeMs[dropEventRead]
-        let happened = dropEventTime[dropEventRead]
+        let ev = dropEventRing[dropEventRead]
         dropEventRead = (dropEventRead + 1) % dropEventCapacity
         sendCond.unlock()
-        let delayMs = (CFAbsoluteTimeGetCurrent() - happened) * 1000
+        let delayMs = (CFAbsoluteTimeGetCurrent() - ev.at) * 1000
         let line = String(format: "event=sender_drop frames=%d bytes=%d oldest_age_ms=%.1f report_delay_ms=%.1f\n",
-            bytes / 4, bytes, ageMs, delayMs)
+            ev.bytes / SquelchProfile.frameBytes, ev.bytes, ev.ageMs, delayMs)
         FileHandle.standardError.write(line.data(using: .utf8)!)
     }
 }
@@ -316,7 +383,7 @@ func emitDropEvents() {
 func emitSenderTelemetry() {
     let now = CFAbsoluteTimeGetCurrent()
     sendCond.lock()
-    let pending = sendPending.count
+    let pending = sendRing.count
     let oldestMs = pending > 0 && pendingSince > 0 ? (now - pendingSince) * 1000 : 0
     let captureFramesNow = captureFrames
     let callbackGapNow = maxCallbackGapMs
@@ -370,9 +437,14 @@ func startSender(_ fd: Int32) {
     let generation = senderGeneration
     sendCond.unlock()
     Thread.detachNewThread {
+        // One drain buffer per sender thread, allocated here — on the sender thread, never on the
+        // callback — and big enough for the whole ring, so a drain is one memcpy that empties the
+        // queue under the lock exactly as `removeAll` emptied the Data queue.
+        let staging = UnsafeMutableRawPointer.allocate(byteCount: sendPendingMax, alignment: 16)
+        defer { staging.deallocate() }
         while true {
             sendCond.lock()
-            while sendPending.isEmpty && !senderDead {
+            while sendRing.isEmpty && !senderDead {
                 _ = sendCond.wait(until: Date(timeIntervalSinceNow: 1.0))
             }
             // Retire on death OR on a newer connection. Without the generation check a
@@ -380,29 +452,28 @@ func startSender(_ fd: Int32) {
             // the accept loop had cleared senderDead for a NEW connection, and drain that
             // connection's audio into the old, closed fd.
             if senderDead || senderGeneration != generation { sendCond.unlock(); return }
-            let chunk = sendPending
-            sendPending.removeAll(keepingCapacity: true)
+            let chunkBytes = sendRing.drain(into: staging)
             pendingSince = 0
             // Hand-off and in-flight publication are one critical section: this audio must
             // never be absent from both counters, or a stall looks like an idle link.
             let writeStart = CFAbsoluteTimeGetCurrent()
-            inflightBytes = chunk.count
+            inflightBytes = chunkBytes
             inflightSince = writeStart
             sendCond.unlock()
-            let ok = chunk.withUnsafeBytes { writeAll(fd, $0.baseAddress!, chunk.count) }
+            let ok = writeAll(fd, staging, chunkBytes)
             let writeMs = (CFAbsoluteTimeGetCurrent() - writeStart) * 1000
             sendCond.lock()
             inflightBytes = 0
             inflightSince = 0
             writeCalls += 1
-            writeBytes += UInt64(chunk.count)
+            writeBytes += UInt64(chunkBytes)
             if writeMs > maxWriteMs { maxWriteMs = writeMs }
             if writeMs > 20 { writesOver20 += 1 }
             if writeMs > 100 { writesOver100 += 1 }
             if writeMs > 250 { writesOver250 += 1 }
             sendCond.unlock()
             if writeMs > 20 {
-                FileHandle.standardError.write(String(format: "event=sender_slow_write bytes=%d duration_ms=%.1f\n", chunk.count, writeMs).data(using: .utf8)!)
+                FileHandle.standardError.write(String(format: "event=sender_slow_write bytes=%d duration_ms=%.1f\n", chunkBytes, writeMs).data(using: .utf8)!)
             }
             emitDropEvents()
             if !ok {
@@ -430,8 +501,10 @@ func startSender(_ fd: Int32) {
 }
 
 // AudioQueue input callback: classify the captured frames, hand the transmit spans to the sender
-// thread, recycle the buffer. Allocation-free and log-free with respect to the state machine: it
-// enqueues spans of the capture buffer and creates no per-frame object.
+// thread, recycle the buffer. Allocation-free and log-free end to end: it classifies in place,
+// copies spans of the capture buffer into storage reserved before AudioQueueStart, and creates no
+// per-frame object. Everything it touches — the send ring, the drop-event ring, the heartbeat
+// buffer — is fixed-size and preallocated.
 let cb: AudioQueueInputCallback = { _, queue, bufRef, _, _, _ in
     let b = bufRef.pointee
     let len = Int(b.mAudioDataByteSize)
@@ -503,6 +576,19 @@ func irregularSizes(_ total: Int) -> [Int] {
         seed = seed &* 6364136223846793005 &+ 1442695040888963407
         let n = min(left, 1 + Int((seed >> 33) % 2000))
         out.append(n); left -= n
+    }
+    return out
+}
+
+/// Deterministic pseudo-random bytes. Byte-exactness through the ring is a property of the
+/// arithmetic rather than of the data, so the payload only has to be something that an off-by-one
+/// or a lost wrapped half cannot accidentally reproduce.
+func pseudoBytes(_ n: Int) -> [UInt8] {
+    var out = [UInt8](); out.reserveCapacity(n)
+    var seed: UInt64 = 0xD1B5_4A32_D192_ED03
+    for _ in 0..<n {
+        seed = seed &* 6364136223846793005 &+ 1442695040888963407
+        out.append(UInt8((seed >> 40) & 0xFF))
     }
     return out
 }
@@ -700,7 +786,7 @@ func selfTestS5() {
     let genOverCap = junk.withUnsafeBytes { enqueueSend($0.baseAddress!, $0.count, 0) }
     require(genOverCap != genBefore, "a drop-oldest in the send queue must be reported to the state machine")
     junk.removeAll()
-    sendCond.lock(); sendPending.removeAll(); pendingSince = 0; sendCond.unlock()
+    sendCond.lock(); sendRing.reset(); pendingSince = 0; sendCond.unlock()
 }
 
 /// Not part of the S1-S5 matrix: the heartbeat's timing is the one part of the sender's silence
@@ -730,6 +816,179 @@ func selfTestContinuous() {
             "continuous-PCM mode must transmit every frame and never suppress")
 }
 
+// Q1-Q4 cover the send queue itself: the callback hands audio to the sender through a fixed
+// circular buffer, and every one of these cases is a way that buffer can silently corrupt or lose
+// the stream while the build stays green and the counters look plausible.
+
+func selfTestQ1() {
+    // Q1 wrap-around. The ring is drained in place, so the cursors walk off the end of the storage
+    // and back to the front; in the live sender that happens roughly every 96 KB, forever. A push
+    // that straddles the boundary must come back as one contiguous, correctly ordered piece.
+    // SABOTAGE: drop the wrapped half of the copy in SendRing.copyIn.
+    let cap = 64
+    var ring = SendRing(capacity: cap)
+    var out = [UInt8](repeating: 0, count: cap)
+
+    let head = pseudoBytes(48)
+    head.withUnsafeBytes { _ = ring.push($0.baseAddress!, 48) }
+    var n = out.withUnsafeMutableBytes { ring.drain(into: $0.baseAddress!) }
+    require(n == 48 && Array(out[0..<48]) == head, "a push that fits before the end must drain back byte-identical")
+    require(ring.isEmpty, "a drain must empty the queue")
+
+    // The cursor now sits at 48 of 64, so this push takes 16 bytes before the end and 16 after it.
+    let wrapped = pseudoBytes(32)
+    wrapped.withUnsafeBytes { _ = ring.push($0.baseAddress!, 32) }
+    require(ring.count == 32, "a wrapped push must queue every byte")
+    n = out.withUnsafeMutableBytes { ring.drain(into: $0.baseAddress!) }
+    require(n == 32, "a wrapped drain must return every queued byte")
+    require(Array(out[0..<32]) == wrapped,
+            "a push that crosses the end of the ring must come back in order, byte for byte")
+
+    // And again from a different offset (cursor at 16), so the case cannot pass on one lucky split.
+    let second = pseudoBytes(56)
+    second.withUnsafeBytes { _ = ring.push($0.baseAddress!, 56) }
+    n = out.withUnsafeMutableBytes { ring.drain(into: $0.baseAddress!) }
+    require(n == 56 && Array(out[0..<56]) == second,
+            "a second wrap at a different offset must come back in order, byte for byte")
+}
+
+func selfTestQ2() {
+    // Q2 the ceiling and the drop it causes. Filling to exactly 96 KB must not drop; one more frame
+    // must discard exactly the OLDEST frame and bump the monotonic drop generation, because that
+    // generation is what revokes squelch qualification — a tail discarded here must never be able
+    // to manufacture a suppressed state the receiver was never told about.
+    // SABOTAGE (a): remove the `senderDropGeneration &+= 1` in enqueueSend.
+    // SABOTAGE (b): discard `over` instead of rounding it up to a whole frame.
+    // SABOTAGE (c): discard the newest queued bytes instead of the oldest.
+    let frameBytes = SquelchProfile.frameBytes
+    let frames = sendPendingMax / frameBytes
+    sendCond.lock(); sendRing.reset(); pendingSince = 0; sendCond.unlock()
+    let genBefore = senderDropGeneration
+    let dropEventsBefore = dropEvents
+    let dropBytesBefore = dropBytes
+    let eventSlot = dropEventWrite
+
+    // Every frame carries its own index, so which frames survived a drop is checkable rather than
+    // inferred from a byte count.
+    var pcm = [UInt8](repeating: 0, count: sendPendingMax)
+    for f in 0..<frames {
+        var v = UInt32(f).littleEndian
+        withUnsafeBytes(of: &v) { src in
+            for k in 0..<frameBytes { pcm[f * frameBytes + k] = src[k] }
+        }
+    }
+    var pushed = 0
+    while pushed < sendPendingMax {      // production-shaped chunks: the default 21 ms quantum
+        let n = min(4096, sendPendingMax - pushed)
+        pcm.withUnsafeBytes { _ = enqueueSend($0.baseAddress! + pushed, n, 0) }
+        pushed += n
+    }
+    require(sendRing.count == sendPendingMax, "an exact-capacity fill must queue every byte")
+    require(senderDropGeneration == genBefore, "filling to exactly the ceiling must not report a drop")
+    require(dropEvents == dropEventsBefore, "filling to exactly the ceiling must not record a drop event")
+
+    let sentinel: [UInt8] = [0xDE, 0xAD, 0xBE, 0xEF]
+    let reported = sentinel.withUnsafeBytes { enqueueSend($0.baseAddress!, frameBytes, 0) }
+    require(senderDropGeneration == genBefore &+ 1,
+            "one frame past the ceiling must bump the drop generation exactly once")
+    require(reported == senderDropGeneration,
+            "enqueueSend must report the post-drop generation to its caller")
+    require(dropEvents == dropEventsBefore + 1, "one frame past the ceiling must record one drop event")
+    require(dropBytes - dropBytesBefore == UInt64(frameBytes), "exactly one frame must be dropped")
+    require(sendRing.count == sendPendingMax, "the queue must stay at its ceiling, never above it")
+    // The drop must also reach the numeric event ring the sender thread formats and logs: a drop
+    // nobody can attribute to a leg and a clock is the same as an unreported drop.
+    // SABOTAGE (d): store a zero byte count into the drop-event slot.
+    require(dropEventWrite == (eventSlot + 1) % dropEventCapacity,
+            "the drop must occupy exactly one slot of the drop-event ring")
+    require(dropEventRing[eventSlot].bytes == frameBytes,
+            "the drop-event ring must record the dropped byte count")
+
+    var out = [UInt8](repeating: 0, count: sendPendingMax)
+    let n = out.withUnsafeMutableBytes { sendRing.drain(into: $0.baseAddress!) }
+    require(n == sendPendingMax, "the queue must drain its whole ceiling")
+    require(Array(out[0..<frameBytes]) == Array(pcm[frameBytes..<(2 * frameBytes)]),
+            "the drop must discard the OLDEST frame: the queue must now begin at frame 1, on a frame boundary")
+    require(Array(out[(sendPendingMax - frameBytes)...]) == sentinel,
+            "the frame that caused the drop must itself be queued, as the newest frame")
+
+    // Frame alignment is the ring's own contract, not an accident of frame-sized callers: a partial
+    // frame of overflow must still cost a whole frame, or everything after it is channel-swapped.
+    var mis = SendRing(capacity: 64)
+    let filler = pseudoBytes(64)
+    filler.withUnsafeBytes { _ = mis.push($0.baseAddress!, 64) }
+    let odd = pseudoBytes(1)
+    let removed = odd.withUnsafeBytes { mis.push($0.baseAddress!, 1) }
+    require(removed == frameBytes, "a one-byte overflow must discard a whole frame, not one byte")
+    require(mis.count == 64 - frameBytes + 1, "the queue must hold what the frame-aligned drop left room for")
+
+    sendCond.lock(); sendRing.reset(); pendingSince = 0; sendCond.unlock()
+}
+
+func selfTestQ3() {
+    // Q3 interleaved partial drains. The sender wakes and takes whatever is queued at that instant,
+    // which is almost never a buffer boundary, and the callback goes on pushing from wherever that
+    // left the cursors. Nothing may be lost, duplicated or reordered across a drain, and a wake
+    // with an empty queue must return nothing rather than replay what was just written.
+    // SABOTAGE: leave `count` unchanged in SendRing.drain.
+    var ring = SendRing(capacity: 256)
+    let payload = pseudoBytes(4000)
+    var scratch = [UInt8](repeating: 0, count: 256)
+    var got = [UInt8](); got.reserveCapacity(payload.count)
+    let chunks = [40, 7, 90, 13, 60, 3, 77, 21]   // max of any three consecutive: 163 of 256
+    var pos = 0, queued = 0, i = 0
+    while pos < payload.count {
+        let n = min(chunks[i % chunks.count], payload.count - pos)
+        let discarded = payload.withUnsafeBytes { ring.push($0.baseAddress! + pos, n) }
+        require(discarded == 0, "Q3 must stay under the ceiling: it tests the drain path, not the drop path")
+        pos += n; queued += n; i += 1
+        require(ring.count == queued, "the queue must account for every pushed byte between drains")
+        if i % 3 == 0 {
+            let m = scratch.withUnsafeMutableBytes { ring.drain(into: $0.baseAddress!) }
+            require(m == queued, "a drain must return exactly what was queued since the last drain")
+            require(ring.count == 0 && ring.isEmpty, "a drain must leave the queue empty")
+            got.append(contentsOf: scratch[0..<m])
+            queued = 0
+            let empty = scratch.withUnsafeMutableBytes { ring.drain(into: $0.baseAddress!) }
+            require(empty == 0, "draining an empty queue must return nothing")
+        }
+    }
+    let m = scratch.withUnsafeMutableBytes { ring.drain(into: $0.baseAddress!) }
+    require(m == queued, "the final drain must return exactly what was left queued")
+    got.append(contentsOf: scratch[0..<m])
+    require(got == payload,
+            "interleaved partial drains must return every byte exactly once, in order")
+}
+
+func selfTestQ4() {
+    // Q4 byte-exactness at production scale. A pseudo-random payload pushed in irregular,
+    // deliberately frame-unaligned chunks through the real 96 KB ceiling, drained at irregular
+    // points, must come out identical. This is the property the whole change is judged on: the
+    // callback's only job is to move bytes, and this rewrote how they are stored.
+    // SABOTAGE: copy in at `head` instead of at the tail in SendRing.copyIn.
+    var ring = SendRing(capacity: sendPendingMax)
+    let payload = pseudoBytes(512 * 1024)
+    var scratch = [UInt8](repeating: 0, count: sendPendingMax)
+    var got = [UInt8](); got.reserveCapacity(payload.count)
+    var pos = 0
+    var drains = 0
+    for n in irregularSizes(payload.count) {      // 1..2000 bytes, no chunk aligned to anything
+        let discarded = payload.withUnsafeBytes { ring.push($0.baseAddress! + pos, n) }
+        require(discarded == 0, "Q4 must stay under the ceiling: it tests the copy, not the drop")
+        pos += n
+        if ring.count > sendPendingMax - 2000 {   // drain before the next chunk could overflow
+            let m = scratch.withUnsafeMutableBytes { ring.drain(into: $0.baseAddress!) }
+            got.append(contentsOf: scratch[0..<m])
+            drains += 1
+        }
+    }
+    let m = scratch.withUnsafeMutableBytes { ring.drain(into: $0.baseAddress!) }
+    got.append(contentsOf: scratch[0..<m])
+    require(drains >= 4, "Q4 must wrap the ring several times, else it proves nothing about wrapping")
+    require(got.count == payload.count, "every pushed byte must be drained exactly once")
+    require(got == payload, "a payload pushed in irregular chunks must leave the ring byte-identical")
+}
+
 /// `--case=S3` runs one case alone. That is how each sabotage is shown to fail its OWN assertion
 /// rather than an earlier case's: several of these fixtures cross the same transitions.
 func runSelfTest(only: String?) {
@@ -737,6 +996,7 @@ func runSelfTest(only: String?) {
         ("profile", selfTestProfile), ("S1", selfTestS1), ("S2", selfTestS2), ("S3", selfTestS3),
         ("S4", selfTestS4), ("S5", selfTestS5), ("heartbeat", selfTestHeartbeat),
         ("continuous", selfTestContinuous),
+        ("Q1", selfTestQ1), ("Q2", selfTestQ2), ("Q3", selfTestQ3), ("Q4", selfTestQ4),
     ]
     if let only = only, !cases.contains(where: { $0.0 == only }) {
         selfTestFail("unknown self-test case \(only)")
@@ -755,9 +1015,11 @@ struct HearCapture {
 
         signal(SIGPIPE, SIG_IGN)   // writing to a closed client must not kill us
         mainLoop = CFRunLoopGetCurrent()
-        // Force the lazy globals the capture callback touches, so their one-time initialization
-        // (including the heartbeat's allocation) never happens inside an audio callback.
-        _ = (heartbeatBuffer, heartbeatBytes, heartbeatInterval, senderSquelch)
+        // Force every lazy global the capture callback touches, so its one-time initialization —
+        // the only allocation anywhere on that path — happens exactly here, before any
+        // AudioQueueStart below, and never inside an audio callback.
+        _ = (heartbeatBuffer, heartbeatBytes, heartbeatInterval, senderSquelch, continuousPCM,
+             sendCond, sendRing.capacity, dropEventRing, dropEventCapacity)
 
         // TCP listen socket
         let srv = socket(AF_INET, SOCK_STREAM, 0)
@@ -810,7 +1072,7 @@ struct HearCapture {
             setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &sndTimeout, socklen_t(MemoryLayout<timeval>.size))
             clientFD = fd
             sendCond.lock()
-            sendPending.removeAll()
+            sendRing.reset()
             pendingSince = 0
             inflightBytes = 0     // a previous connection's stalled write must not be reported against this one
             inflightSince = 0
