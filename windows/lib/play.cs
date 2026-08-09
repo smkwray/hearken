@@ -1725,9 +1725,129 @@ namespace AudioBridge {
       }
     }
 
+    // The suite must assert its own INVENTORY, not just its result. Four cases were silently
+    // deleted during this build by wholesale region replacement, and the suite kept reporting ok
+    // throughout, because a deleted test cannot fail. Every case registers by name and the run
+    // fails if the set ever differs from ExpectedCases -- so losing one is as loud as breaking one.
+    static readonly System.Collections.Generic.List<string> ranCases =
+      new System.Collections.Generic.List<string>();
+    static void Case(string id) {
+      if (ranCases.Contains(id)) throw new Exception("duplicate self-test case id: " + id);
+      ranCases.Add(id);
+    }
+    static readonly string[] ExpectedCases = new string[] {
+      "exchange", "profile-mode", "R1", "R5", "R6", "R10", "trim-attribution",
+      "no-discard", "cadence", "cadence-teeth",
+      "A1", "A2", "A3", "A5", "A6", "C1", "C2",
+      "R2", "R3", "R4", "R7", "R9", "P1", "P2", "P3", "P4",
+      "clean-feed", "forced-adopt", "freshness",
+    };
+    static void AssertInventory() {
+      var missing = new System.Collections.Generic.List<string>();
+      foreach (string id in ExpectedCases) if (!ranCases.Contains(id)) missing.Add(id);
+      var extra = new System.Collections.Generic.List<string>();
+      foreach (string id in ranCases) if (Array.IndexOf(ExpectedCases, id) < 0) extra.Add(id);
+      if (missing.Count > 0 || extra.Count > 0)
+        throw new Exception("self-test inventory changed - missing [" + string.Join(",", missing.ToArray()) +
+          "] unexpected [" + string.Join(",", extra.ToArray()) + "]. A deleted case is a failure.");
+    }
+
     static void RunSelfTest() {
       long perSec = Stopwatch.Frequency;
       const int HysteresisForTest = 20;
+      // R1 / R5: the exact confirmation boundary, and its independence from read shape. These
+      // two were WRITTEN, FALSIFIED, AND THEN SILENTLY DELETED by a later region replacement --
+      // ClassifyStream was left defined and never called. Restored.
+      Case("R1"); Case("R5");
+      {
+        const int activeBefore = 100, activeAfter = 50;
+        int[] chunkShapes = new int[] { 1, 2, 3, 7, 257, 4096, 0 };   // frames per Scan; 0 = all
+        foreach (int shape in chunkShapes) {
+          int confirms, resumes, confirmAt, resumeAt;
+          ClassifyStream(activeBefore, SquelchProfile.ConfirmFrames - 1, activeAfter, shape,
+            out confirms, out resumes, out confirmAt, out resumeAt);
+          if (confirms != 0)
+            throw new Exception("11,999 silent frames must remain qualifying, not confirm");
+        }
+        int expectConfirm = activeBefore + SquelchProfile.ConfirmFrames - 1;
+        int expectResume = activeBefore + SquelchProfile.ConfirmFrames;
+        foreach (int shape in chunkShapes) {
+          int confirms, resumes, confirmAt, resumeAt;
+          ClassifyStream(activeBefore, SquelchProfile.ConfirmFrames, activeAfter, shape,
+            out confirms, out resumes, out confirmAt, out resumeAt);
+          if (confirms != 1)
+            throw new Exception("frame 12,000 must confirm exactly once, got " + confirms);
+          if (confirmAt != expectConfirm)
+            throw new Exception("confirmation landed on frame " + confirmAt + ", expected " +
+              expectConfirm + " (chunk shape " + shape + ") - read shape must not move it");
+          if (resumes != 1 || resumeAt != expectResume)
+            throw new Exception("resume must land exactly on the first active frame after silence");
+        }
+        // A silent run broken by one active frame restarts; two half-runs never add up.
+        var c = new SourceClassifier(); var spans = new SourceSpan[64];
+        byte[] half = BuildStream(0, SquelchProfile.ConfirmFrames / 2, 1);
+        c.Scan(half, 0, half.Length, spans);
+        if (c.Confirmed) throw new Exception("half a qualifying run must not confirm");
+        if (c.SilentRun != 0) throw new Exception("an active frame must reset the silent run");
+        byte[] second = BuildStream(0, SquelchProfile.ConfirmFrames / 2, 0);
+        c.Scan(second, 0, second.Length, spans);
+        if (c.Confirmed)
+          throw new Exception("two half-runs split by program must not add up to a confirmation");
+        // The threshold frame is media and is inserted; only what follows is discardable.
+        var t2 = new SourceClassifier();
+        byte[] tail2 = BuildStream(0, SquelchProfile.ConfirmFrames + 480, 0);
+        int n2 = t2.Scan(tail2, 0, tail2.Length, spans);
+        bool sawDiscard = false;
+        for (int i = 0; i < n2; i++) {
+          if (spans[i].Edge == SourceEdge.Confirmed && !spans[i].Insert)
+            throw new Exception("the threshold frame is media and must still be inserted");
+          if (!spans[i].Insert) {
+            sawDiscard = true;
+            if (spans[i].PaysDebt) throw new Exception("confirmed silence must not pay down arrival debt");
+          }
+        }
+        if (!sawDiscard) throw new Exception("silence past the threshold must be discarded");
+      }
+
+      // The measurement handoff between telemetry and network threads. Also deleted and restored:
+      // the underrun flag reports "since the last call", so latest-wins would drop a starvation
+      // from the only path that raises the target for one.
+      Case("exchange");
+      {
+        var ex = new PolicyExchange();
+        int exQ; bool exU;
+        if (ex.TakeMeasurement(out exQ, out exU))
+          throw new Exception("an empty exchange must report no pending measurement");
+        ex.PublishMeasurement(480, false);
+        ex.PublishMeasurement(512, true);
+        ex.PublishMeasurement(480, false);
+        if (!ex.TakeMeasurement(out exQ, out exU))
+          throw new Exception("a published measurement must be pending");
+        if (exQ != 480) throw new Exception("the render quantum must be latest-wins");
+        if (!exU) throw new Exception("an underrun must survive a later clean publish (raise evidence)");
+        if (ex.TakeMeasurement(out exQ, out exU))
+          throw new Exception("a consumed measurement must not be pending again");
+        ex.PublishMeasurement(480, false);
+        ex.TakeMeasurement(out exQ, out exU);
+        if (exU) throw new Exception("an underrun must clear on the take, not be counted twice");
+      }
+
+      // A trim taken while the endpoint is down is attributed to the transition, so a device
+      // problem can never be counted as the network delivering late. Deleted and restored.
+      Case("trim-attribution");
+      {
+        var outage = Primed(Audio.Frames(100));
+        outage.PublishTarget(Audio.MinPrebufferMs);
+        outage.BeginOutputOutage();
+        outage.AddFrames(MakeTone(Audio.Frames(400)), 0, Audio.Frames(400) * 4);
+        outage.EndOutputOutage();
+        if (outage.FreshnessTrimCount == 0)
+          throw new Exception("a stale backlog must still be trimmed during an outage");
+        if (outage.FreshnessTrimTransitionCount != outage.FreshnessTrimCount)
+          throw new Exception("a trim during an output transition must be attributed to the transition");
+      }
+
+      Case("R6");
       // R6: a partial frame advances nothing. One, two or three bytes must not classify, must
       // not move the arrival clock, and must not start or finish qualification -- the final
       // byte completes exactly one frame. This is what makes a one-byte read and a coalesced
@@ -1773,6 +1893,7 @@ namespace AudioBridge {
         if (gl != 1000 || gr != -1000) throw new Exception("gain test failed");
       }
 
+      Case("R10");
       // R10: classification reads SOURCE pcm, before gain. At zero gain every inserted sample
       // is silent, and classifying post-gain audio would declare the source squelched and start
       // forgiving real network gaps.
@@ -1803,6 +1924,7 @@ namespace AudioBridge {
       short outR = (short)(output[2] | (output[3] << 8));
       if (outL != 1000 || outR != -1000) throw new Exception("adaptive provider sample test failed");
 
+      Case("no-discard");
       // The load-bearing regression: an underrun must NOT discard buffered audio.
       // The old EnterStarved zeroed head/frames/phase, so a shortage of a few frames
       // threw away everything already received and forced a full refill.
@@ -1822,6 +1944,7 @@ namespace AudioBridge {
       if (soft.SoftUnderrunCount != 1 || soft.HardRebufferCount != 0)
         throw new Exception("small shortage must conceal, not rebuffer");
 
+      Case("cadence");
       // The measured failure, replayed: media arrives in ~105 ms bursts (the cadence
       // seen on both days of the 2026-08-06 court) while the device pulls it back in
       // small quanta. A target that covers burst + quantum + margin must not starve.
@@ -1837,6 +1960,7 @@ namespace AudioBridge {
       if (sized.HardRebufferCount != 0 || sized.SoftUnderrunCount != 0)
         throw new Exception("sized target must survive the measured 105 ms burst cadence");
 
+      Case("cadence-teeth");
       // Teeth for the check above: the shipped 40 ms floor cannot cover that cadence,
       // so the same replay MUST starve. If this ever stops starving, the test is vacuous.
       var undersized = new AdaptivePlayout();
@@ -1847,6 +1971,7 @@ namespace AudioBridge {
       if (undersized.HardRebufferCount + undersized.SoftUnderrunCount == 0)
         throw new Exception("undersized target must starve, else the cadence test proves nothing");
 
+      Case("profile-mode");
       // Continuous PCM must be one coordinated mode. With forgiveness off the receiver never
       // confirms, so it never excuses a gap -- which is the only safe pairing with a sender that
       // has stopped suppressing.
@@ -1864,6 +1989,7 @@ namespace AudioBridge {
       }
 
       // ---- render timeline: the boundary lives in the audio, not in a flag ---------------
+      Case("A1");
       // A1: audio the source sent BEFORE going quiet belongs to the listener. Draining must
       // ignore the prebuffer target -- routing it through the ordinary rebuffer gate holds a
       // below-target ring and replays that tail late, which is exactly the defect.
@@ -1886,6 +2012,7 @@ namespace AudioBridge {
           throw new Exception("past the boundary the listener must get deliberate silence");
       }
 
+      Case("A3");
       // A3: at the talkspurt boundary, withhold until a full target of POST-boundary audio
       // exists, then fade in once. Zero-fill while waiting is intentional, not starvation.
       {
@@ -1909,6 +2036,7 @@ namespace AudioBridge {
           throw new Exception("a full target of post-boundary audio must resume playback");
       }
 
+      Case("A6");
       // A6: boundaries are idempotent. A repeated heartbeat or a retried batch must not add a
       // second boundary or duplicate a talkspurt.
       {
@@ -1924,6 +2052,7 @@ namespace AudioBridge {
             prov.MarkersCrossedIdleForTest);
       }
 
+      Case("A2");
       // A2: a boundary landing mid-request renders the prefix and zeroes the remainder, without
       // charging the shortfall as starvation. Checking source state once per callback would
       // either replay past the boundary or throw the prefix away.
@@ -1944,6 +2073,7 @@ namespace AudioBridge {
           throw new Exception("a mid-request boundary must still be crossed");
       }
 
+      Case("A5");
       // A5: a freshness trim advances the read position and can step over boundaries. If it
       // does so without applying them, render state no longer matches the first retained frame.
       {
@@ -1962,6 +2092,7 @@ namespace AudioBridge {
           throw new Exception("a trim that steps over a boundary must apply it, not leave it behind");
       }
 
+      Case("C1"); Case("C2");
       // C1/C2: a receiver whose output never opened must not keep a fragment of an old phrase
       // across a silence and play it after the next talkspurt, and must not open the output on
       // observations gathered before that silence.
@@ -1997,6 +2128,7 @@ namespace AudioBridge {
           throw new Exception("with the output open, confirmation must place a drain boundary");
       }
 
+      Case("R9");
       // R9: confirmation and resumption inside ONE assembled read. Stream order must still give
       // exactly one enter, one exit, a new debt epoch, and no lost active frame.
       {
@@ -2027,6 +2159,7 @@ namespace AudioBridge {
           throw new Exception("qualifying media and the talkspurt must both be inserted, got " + inserted);
       }
 
+      Case("P3");
       // P3: an arm that the evidence no longer supports expires at confirmation; one it still
       // supports survives to be adopted at the talkspurt.
       {
@@ -2052,6 +2185,7 @@ namespace AudioBridge {
       // class owns, and "was the last read silent" is no longer evidence of anything.
 
 
+      Case("R7");
       // R7: every frame transmitted before confirmation is media and pays down debt, silent or
       // not. The retired rule that only program audio carried lateness is what made an
       // unconfirmed silent stretch look free.
@@ -2085,6 +2219,7 @@ namespace AudioBridge {
             "still owing " + pol.OutstandingDebtMs);
       }
 
+      Case("R2");
       // R2: silence shorter than the confirmation threshold, then a stall, then program. The
       // stall must be charged. This is the defect the whole phase exists to remove -- one
       // silent block used to forgive it.
@@ -2108,6 +2243,7 @@ namespace AudioBridge {
           throw new Exception("a stall after " + blocks + " silent block(s) must be charged");
       }
 
+      Case("R3");
       // R3: the gap verdict is latched before the read. 11,999 silent frames, a 600 ms stall,
       // then a read whose FIRST frame crosses the threshold -- the stall began unconfirmed and
       // must be charged, however the returning bytes classify.
@@ -2127,6 +2263,7 @@ namespace AudioBridge {
           throw new Exception("a gap that began unconfirmed must be charged even if the read that closes it confirms");
       }
 
+      Case("R4");
       // R4: once confirmed, silence of ANY length is free. A cap would reintroduce the defect
       // for exactly the long pauses the mechanism exists to handle.
       {
@@ -2153,6 +2290,7 @@ namespace AudioBridge {
         if (pol.DebtEpoch == 0) throw new Exception("resuming must open a new debt epoch");
       }
 
+      Case("P2"); Case("P4");
       // P2 / P4: heartbeats are idempotent, and confirmed silence must not manufacture stable
       // time. Sixty seconds of it must not walk the target down on its own.
       {
@@ -2210,6 +2348,7 @@ namespace AudioBridge {
             "lowered " + pol.LowerCount + " time(s) after only ~35 s of active time");
       }
 
+      Case("P1");
       // P1: confirmation ends debt continuity without deleting the evidence. A stall in the
       // second before the source went quiet must still be visible to the call that decides how
       // far the target may drop.
@@ -2234,6 +2373,7 @@ namespace AudioBridge {
           throw new Exception("confirmation must not erase the measured stall that preceded it");
       }
 
+      Case("clean-feed");
       // Teeth for the whole group: a clean steady feed must NOT be taxed, or every check above
       // would pass on a policy that simply always raises.
       {
@@ -2251,6 +2391,7 @@ namespace AudioBridge {
           throw new Exception("a clean steady feed must stay at the floor, not inherit a tax");
       }
 
+      Case("forced-adopt");
       // A degrading path arms a raise that occupancy will never reach by itself, because the
       // ring is starving precisely when the bigger buffer is needed. Forced adoption -- what a
       // hard rebuffer performs -- must take it regardless of occupancy.
@@ -2271,6 +2412,7 @@ namespace AudioBridge {
           throw new Exception("adopting the armed raise must actually raise the target");
       }
 
+      Case("freshness");
       // Freshness trim bounds latency without the old occupancy-only reset.
       var trim = new AdaptivePlayout();
       trim.PublishTarget(Audio.MinPrebufferMs);
@@ -2279,7 +2421,8 @@ namespace AudioBridge {
       if (trim.FreshnessTrimCount == 0) throw new Exception("stale backlog must be trimmed");
       if (trim.BufferedMs > Audio.MinPrebufferMs + 200) throw new Exception("trim did not bound latency");
 
-      Console.WriteLine("play self-test ok");
+      AssertInventory();
+      Console.WriteLine("play self-test ok (" + ranCases.Count + " cases)");
     }
 
     // Primed returns a provider that has left its opening prebuffer and consumed the
