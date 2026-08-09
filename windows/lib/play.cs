@@ -223,16 +223,23 @@ namespace AudioBridge {
         int receivedFrames = bytes / Audio.FrameBytes;
         if (lastReadTicks != 0) {
           if (afterSilence) {
-            // A gap that opened after a SILENT read is source squelch, not lateness. The
-            // sender stops transmitting only once it has already sent squelchHold (0.25 s)
-            // of silence, so by construction no media was owed across the gap. Charging it
-            // is what pinned the target at the ceiling: a pause shorter than the sender's
-            // 2 s keepalive puts no bytes on the wire at all, yet never reaches the
-            // keepalive-gap test that declares idle, so the whole pause was billed as
-            // arrival debt. Speech, video and gaps between tracks are made of such pauses.
-            // A genuine stall interrupts PROGRAM audio and is still charged in full; the
-            // residual exposure is a stall starting inside the 0.25 s hold, and that
-            // surfaces as an underrun, which raises the target on its own evidence.
+            // A gap that opened after a SILENT read is treated as source squelch, not
+            // lateness. Charging it is what pinned the target at the ceiling: a pause
+            // shorter than the sender's 2 s keepalive puts no bytes on the wire at all,
+            // yet never reaches the keepalive-gap test that declares idle, so the whole
+            // pause was billed as arrival debt. Speech, video and gaps between tracks are
+            // made of such pauses.
+            //
+            // KNOWN TOO WIDE (audited 2026-08-09, do/gptpro/receiver-oscillation-path-audit_ingest_20260809.md).
+            // This does NOT verify that squelchHold (0.25 s) of silence preceded the gap.
+            // ANY single completed TCP read with peak <= SilencePeak arms the excusal, and
+            // read boundaries are arbitrary -- this file already carries split frames across
+            // reads. So one silent quantum can forgive an ordinary program stall that began
+            // before the sender ever entered squelch. The direction is right and the
+            // underrun-driven raise still backstops it, but the exposure is wider than a
+            // stall starting inside the hold. The fix is to count contiguous silent MEDIA
+            // FRAMES (12,000 = 250 ms) on both ends and excuse only from a confirmed squelch;
+            // it needs the matching sender change, so it is staged, not sneaked in here.
             squelchGapCount++;
             double gapMs = (nowTicks - lastReadTicks) * 1000.0 / ticksPerSecond;
             if (gapMs > squelchGapMaxMs) squelchGapMaxMs = gapMs;
