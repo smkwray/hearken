@@ -632,7 +632,13 @@ namespace AudioBridge {
           // and render what is already here.
           integralMsSeconds = 0;
           softPending = false;
-          if (mode == RenderMode.ActivePlaying) mode = RenderMode.DrainToIdle;
+          // Also from ResumePrebuffer. A short talkspurt under a high target never accumulates
+          // the target behind its boundary -- the source went quiet first -- so waiting there is
+          // waiting for audio that will never come. The phrase would be held until some later
+          // talkspurt pushed occupancy over the line and then played stale, before an unrelated
+          // sound. Draining renders it where it belongs and reaches the new boundary.
+          if (mode == RenderMode.ActivePlaying || mode == RenderMode.ResumePrebuffer)
+            mode = RenderMode.DrainToIdle;
           return true;
         }
       }
@@ -1465,6 +1471,11 @@ namespace AudioBridge {
       }
     }
 
+    // A read carries media only once it completes a whole stereo frame. A 1-3 byte read reaching
+    // the policy moved the arrival clock, opened epochs, consumed a telemetry measurement and took
+    // part in the cold-open decision -- making all of it depend on how TCP chopped the stream.
+    static bool ReadCarriesMedia(int completeBytes) { return completeBytes >= SquelchProfile.FrameBytes; }
+
     static void RunPlay(NetworkStream net) {
       var provider = new AdaptivePlayout();
       var policy = new ArrivalPolicy();
@@ -1529,6 +1540,16 @@ namespace AudioBridge {
           // applied per span, and only to spans that will actually be inserted.
           int complete = assembler.Assemble(tmp, n);
 
+          // A 1-3 byte read carries no media. Letting it reach the policy moved the arrival
+          // clock, opened epochs, consumed a telemetry measurement and took part in the cold-open
+          // decision -- making all of that depend on how TCP happened to chop the stream, which
+          // is the exact dependence this design exists to remove. The interval simply continues
+          // until a complete frame lands.
+          if (!ReadCarriesMedia(complete)) {
+            lock (telemetryGate) { intervalBytes += n; }
+            continue;
+          }
+
           // The gap in FRONT of this read is judged by the state that existed before the
           // read blocked -- never by what the returning bytes turn out to contain.
           policy.OnGap(readTicks, gapStartedConfirmed, provider.RatioSnapshot);
@@ -1582,10 +1603,6 @@ namespace AudioBridge {
             provider.PublishTarget(policy.PrebufferMs);
             exchange.PublishDescription(policy.Describe());
           }
-          // A block the assembler withheld (squelch keepalive) must not be re-inserted
-          // later, so alignment is preserved by Push regardless of the insert decision.
-          if (complete == 0 && n > 0 && assembler.TailBytes == 0)
-            Console.Error.WriteLine("event=empty_push bytes=" + n);
           lock (telemetryGate) {
             intervalBytes += n;
             if (lastRead != 0 && readAt - lastRead > maxReadGapMs) maxReadGapMs = readAt - lastRead;
@@ -1736,9 +1753,9 @@ namespace AudioBridge {
       ranCases.Add(id);
     }
     static readonly string[] ExpectedCases = new string[] {
-      "exchange", "profile-mode", "R1", "R5", "R6", "R10", "trim-attribution",
+      "exchange", "profile-mode", "R1", "R5", "R6", "R6b", "R10", "trim-attribution",
       "no-discard", "cadence", "cadence-teeth",
-      "A1", "A2", "A3", "A5", "A6", "C1", "C2",
+      "A1", "A2", "A3", "A5", "A6", "A7", "C1", "C2",
       "R2", "R3", "R4", "R7", "R9", "P1", "P2", "P3", "P4",
       "clean-feed", "forced-adopt", "freshness",
     };
@@ -1845,6 +1862,18 @@ namespace AudioBridge {
           throw new Exception("a stale backlog must still be trimmed during an outage");
         if (outage.FreshnessTrimTransitionCount != outage.FreshnessTrimCount)
           throw new Exception("a trim during an output transition must be attributed to the transition");
+      }
+
+      // R6b: the decision that keeps partial reads away from policy, extracted so the branch is
+      // under test rather than only its call site. NOTE: this does NOT establish full read-shape
+      // invariance -- that needs the production read processor extracted so the suite can drive
+      // the real thing instead of the DriveRead mirror. Recorded as an open condition.
+      Case("R6b");
+      {
+        if (ReadCarriesMedia(0) || ReadCarriesMedia(1) || ReadCarriesMedia(2) || ReadCarriesMedia(3))
+          throw new Exception("a read short of one whole frame carries no media and must not reach policy");
+        if (!ReadCarriesMedia(SquelchProfile.FrameBytes))
+          throw new Exception("one complete frame is media");
       }
 
       Case("R6");
@@ -2050,6 +2079,32 @@ namespace AudioBridge {
         if (prov.MarkersCrossedIdleForTest != 1)
           throw new Exception("a duplicated boundary must not be crossed twice, crossed " +
             prov.MarkersCrossedIdleForTest);
+      }
+
+      // A7: a short talkspurt under a HIGH target, then confirmation. The target can never be
+      // reached behind that boundary because the source already went quiet, so waiting there
+      // holds the phrase until some later talkspurt drags occupancy over the line and plays it
+      // stale, before an unrelated sound. Confirmation must drain it instead.
+      Case("A7");
+      {
+        var prov = new AdaptivePlayout();
+        prov.PublishTarget(400);                            // a high adopted target
+        byte[] outBuf = new byte[Audio.Frames(10) * 4];
+        prov.MarkIdleStart(1);
+        prov.Read(outBuf, 0, outBuf.Length);                // reach idle silence
+        prov.MarkTalkspurt(2);
+        int shortPhrase = Audio.Frames(50);                 // far below the 400 ms target
+        prov.AddFrames(MakeTone(shortPhrase), 0, shortPhrase * 4);
+        prov.Read(outBuf, 0, outBuf.Length);
+        if (prov.RenderModeForTest != (int)RenderMode.ResumePrebuffer)
+          throw new Exception("the fixture must be waiting on the resume target, else A7 proves nothing");
+        long suppliedBefore = prov.SuppliedFramesForTest;
+        prov.MarkIdleStart(3);                              // the source went quiet again
+        for (int i = 0; i < 12; i++) prov.Read(outBuf, 0, outBuf.Length);
+        if (prov.SuppliedFramesForTest <= suppliedBefore)
+          throw new Exception("a short phrase must be drained when the source reconfirms, not held");
+        if (prov.RenderModeForTest != (int)RenderMode.IdleSilence)
+          throw new Exception("reconfirmation must reach the new boundary, not wait forever");
       }
 
       Case("A2");
