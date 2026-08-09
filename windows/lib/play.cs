@@ -1157,6 +1157,42 @@ namespace AudioBridge {
       }
     }
 
+    // PolicyExchange makes the network thread the sole reader AND writer of ArrivalPolicy.
+    //
+    // Before this, the telemetry thread called Recompute() -- which writes prebufferMs,
+    // armedPrebufferMs, stableSinceTicks, lastLowerTicks and the raise/lower counters -- and also
+    // read PrebufferMs and Describe(), while the network thread wrote the same object from
+    // OnRead/AdoptArmed/ApplyIdleTarget. The class comment above ArrivalPolicy claimed "It runs
+    // ONLY on the network thread", which is precisely why the race went unseen. The silence state
+    // machine that follows is edge-sensitive and must not be built over it.
+    //
+    // Telemetry now only measures the provider and hands the numbers over; the network thread
+    // recomputes and hands back a formatted description for the log line.
+    class PolicyExchange {
+      readonly object gate = new object();
+      int quantumFrames;
+      bool underrun, havePending;
+      string description = "";
+
+      // Telemetry -> network. The quantum is latest-wins, but the underrun flag ACCUMULATES:
+      // TakeRequestQuantum reports "since the last call", so overwriting it would silently drop a
+      // starvation that the raise path is the only consumer of.
+      public void PublishMeasurement(int q, bool u) {
+        lock (gate) { quantumFrames = q; underrun = underrun || u; havePending = true; }
+      }
+      public bool TakeMeasurement(out int q, out bool u) {
+        lock (gate) {
+          q = quantumFrames; u = underrun;
+          bool had = havePending;
+          havePending = false; underrun = false;
+          return had;
+        }
+      }
+      // Network -> telemetry. A snapshot string, so the telemetry thread never touches policy.
+      public void PublishDescription(string d) { lock (gate) { description = d; } }
+      public string TakeDescription() { lock (gate) { return description; } }
+    }
+
     static void RunPlay(NetworkStream net) {
       var provider = new AdaptivePlayout();
       var policy = new ArrivalPolicy();
@@ -1177,6 +1213,8 @@ namespace AudioBridge {
       // Telemetry runs on its own thread. Emitting it from the read loop meant no line
       // was produced while a read was stalled -- exactly the interval worth seeing --
       // which is the same blind spot the sender had.
+      var exchange = new PolicyExchange();
+      exchange.PublishDescription(policy.Describe());   // so the first log line is not blank
       var telemetry = new Thread(delegate() {
         long lastEmit = sw.ElapsedMilliseconds;
         while (!telemetryStop.WaitOne(1000)) {
@@ -1192,10 +1230,10 @@ namespace AudioBridge {
             devBuf = chain == null ? 0 : chain.LatencyMs;
             state = chain == null ? "prebuffer" : chain.Out.PlaybackState.ToString();
           }
-          policy.Recompute(Stopwatch.GetTimestamp(), quantum, underrun);
-          provider.PublishTarget(policy.PrebufferMs);
+          // Hand the measurement to the network thread rather than mutating policy here.
+          exchange.PublishMeasurement(quantum, underrun);
           Console.Error.WriteLine(provider.TakeTelemetry(bytesNow, now - lastEmit, gapNow,
-            state, ep, gen, mode, devBuf, policy.Describe()));
+            state, ep, gen, mode, devBuf, exchange.TakeDescription()));
           lastEmit = now;
         }
       });
@@ -1236,6 +1274,15 @@ namespace AudioBridge {
           if (hardNow != lastHardRebuffer) {
             lastHardRebuffer = hardNow;
             if (policy.AdoptArmed(provider.BufferedFrames, true)) provider.PublishTarget(policy.PrebufferMs);
+          }
+          // Recompute runs HERE, on the thread that owns the policy, once per published
+          // measurement (~1 s). Placed after the adoption points above so it sees the state they
+          // just produced, and after the read so the target reflects this block's arrival.
+          int measQuantum; bool measUnderrun;
+          if (exchange.TakeMeasurement(out measQuantum, out measUnderrun)) {
+            policy.Recompute(readTicks, measQuantum, measUnderrun);
+            provider.PublishTarget(policy.PrebufferMs);
+            exchange.PublishDescription(policy.Describe());
           }
           // A block the assembler withheld (squelch keepalive) must not be re-inserted
           // later, so alignment is preserved by Push regardless of the insert decision.
@@ -1527,6 +1574,27 @@ namespace AudioBridge {
       if (ShouldReconcileOnStop(liveChain))
         throw new Exception("our own teardown must not re-arm reconciliation (the reopen storm)");
       activeEndpointId = null;
+
+      // The measurement handoff that removes the ArrivalPolicy race. The quantum may be
+      // overwritten between reads, but a dropped underrun would hide a real starvation from the
+      // only path that raises the target for one -- so it must accumulate across publishes and
+      // clear exactly once, on the take.
+      var ex = new PolicyExchange();
+      int exQ; bool exU;
+      if (ex.TakeMeasurement(out exQ, out exU))
+        throw new Exception("an empty exchange must report no pending measurement");
+      ex.PublishMeasurement(480, false);
+      ex.PublishMeasurement(512, true);      // the starvation
+      ex.PublishMeasurement(480, false);     // a later clean second must not erase it
+      if (!ex.TakeMeasurement(out exQ, out exU))
+        throw new Exception("a published measurement must be pending");
+      if (exQ != 480) throw new Exception("the render quantum must be latest-wins");
+      if (!exU) throw new Exception("an underrun must survive a later clean publish (raise evidence)");
+      if (ex.TakeMeasurement(out exQ, out exU))
+        throw new Exception("a consumed measurement must not be pending again");
+      ex.PublishMeasurement(480, false);
+      ex.TakeMeasurement(out exQ, out exU);
+      if (exU) throw new Exception("an underrun must clear on the take, not be counted twice");
 
       // A trim taken while the endpoint is down is attributed to the outage, so a device
       // problem can never again be counted as the network delivering late.
