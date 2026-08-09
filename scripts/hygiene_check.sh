@@ -63,6 +63,25 @@ else
   git diff --check || violations=$((violations + 1))
 fi
 
+# The supervision loop in play.cs has no automated coverage -- the self-test drives ProcessRead,
+# not RunPlay's body -- and region edits in that large file have silently eaten load-bearing call
+# sites three times. Assert the call sites exist. A missing one is a regression no test can see.
+required_sites=(
+  "ProcessRead(ctx, tmp, n, readTicks"        # the read becomes state
+  "hardNow != lastHardRebuffer"               # the hard-rebuffer adoption point
+  "policy.Recompute(readTicks"                # policy recomputation, on its owning thread
+  "exchange.TakeMeasurement"                  # telemetry -> network handoff
+  "exchange.PublishMeasurement"               # the other half of it
+  "policy.ObservationSatisfied(readTicks)"    # the cold-open gate
+  "OnConfirmedEntry"                          # confirmed-entry branch reachable from ProcessRead
+)
+for site in "${required_sites[@]}"; do
+  if ! grep -qF "$site" windows/lib/play.cs; then
+    echo "hygiene_check: FAIL - required call site missing from play.cs: $site" >&2
+    violations=$((violations + 1))
+  fi
+done
+
 # Generated squelch-profile bindings must match profile/squelch.profile. Parallel hand-written
 # constants in Swift and C# can silently disagree, and disagreement is unsafe in one direction:
 # a receiver confirming silence sooner than the sender suppresses forgives real transport stalls.

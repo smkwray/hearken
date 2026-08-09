@@ -1557,16 +1557,85 @@ namespace AudioBridge {
     // part in the cold-open decision -- making all of it depend on how TCP chopped the stream.
     static bool ReadCarriesMedia(int completeBytes) { return completeBytes >= SquelchProfile.FrameBytes; }
 
+    // Everything a read does to state, in one place. RunPlay calls this and so does the self-test,
+    // so the suite cannot drift from production ordering the way a hand-written mirror can -- the
+    // previous helper reproduced the ordering by hand and would not have noticed the loop changing.
+    class ReadContext {
+      public AdaptivePlayout Provider;
+      public ArrivalPolicy Policy;
+      public SourceClassifier Classifier;
+      public FrameAssembler Assembler;
+      public SourceSpan[] Spans;
+      public ProviderOp[] Ops;
+      public long TransitionId, BatchId;
+      public float Gain = 1.0f;
+      public bool OutputOpen;
+      public int LastCompleteBytes;
+    }
+
+    static void ProcessRead(ReadContext c, byte[] input, int n, long readTicks,
+                            bool gapStartedConfirmed, double consumeRatio) {
+      int complete = c.Assembler.Assemble(input, n);
+      c.LastCompleteBytes = complete;
+      // A 1-3 byte read carries no media. Letting it reach the policy moved the arrival clock,
+      // opened epochs, consumed a telemetry measurement and took part in the cold-open decision --
+      // making all of it depend on how TCP chopped the stream.
+      if (!ReadCarriesMedia(complete)) return;
+
+      // The gap in FRONT of this read is judged by the state that existed before the read
+      // blocked -- never by what the returning bytes turn out to contain.
+      c.Policy.OnGap(readTicks, gapStartedConfirmed, consumeRatio);
+
+      int spanCount = c.Classifier.Scan(c.Assembler.Buffer_, 0, complete, c.Spans);
+      int opCount = 0;
+      bool coldClear = false;
+      for (int si = 0; si < spanCount; si++) {
+        int frames = c.Spans[si].Bytes / SquelchProfile.FrameBytes;
+        // Resume happens BEFORE its own frames are handled: the talkspurt's first frame must not
+        // repay debt from the interval that was excused.
+        if (c.Spans[si].Edge == SourceEdge.Resumed) {
+          c.Policy.ResumeDebt(readTicks);
+          c.Policy.AdoptArmed(c.Provider.BufferedFrames, true);
+          c.Ops[opCount].Kind = OpKind.AdoptTarget; c.Ops[opCount].TargetMs = c.Policy.PrebufferMs; opCount++;
+          c.Ops[opCount].Kind = OpKind.Talkspurt; c.Ops[opCount].TransitionId = ++c.TransitionId; opCount++;
+        }
+        if (c.Spans[si].Insert) {
+          if (c.Gain != 1.0f) ApplyGain(c.Assembler.Buffer_, c.Spans[si].Offset, c.Spans[si].Bytes, c.Gain);
+          c.Ops[opCount].Kind = OpKind.Pcm;
+          c.Ops[opCount].Offset = c.Spans[si].Offset; c.Ops[opCount].Bytes = c.Spans[si].Bytes; opCount++;
+        }
+        c.Policy.OnMedia(readTicks, frames, c.Spans[si].Active);
+        // The threshold frame is media and is already in the batch ahead of this boundary; only
+        // now does the source count as confirmed.
+        if (c.Spans[si].Edge == SourceEdge.Confirmed) {
+          c.Policy.SuspendDebt(readTicks);
+          c.Policy.ApplyIdleTarget(c.Provider.RequestQuantumFrames);
+          c.Ops[opCount].Kind = OpKind.AdoptTarget; c.Ops[opCount].TargetMs = c.Policy.PrebufferMs; opCount++;
+          if (c.OutputOpen) {
+            c.Ops[opCount].Kind = OpKind.IdleStart; c.Ops[opCount].TransitionId = ++c.TransitionId; opCount++;
+          } else coldClear = true;
+        }
+      }
+      c.Provider.Commit(c.Assembler.Buffer_, c.Ops, opCount, ++c.BatchId);
+      // With the output closed nothing is rendering, so this needs no atomicity.
+      if (coldClear) { c.Provider.ClearForColdStart(); c.Policy.ResetColdObservation(); }
+      if (!c.Classifier.Confirmed && spanCount > 0) {
+        if (c.Policy.AdoptArmed(c.Provider.BufferedFrames, false))
+          c.Provider.PublishTarget(c.Policy.PrebufferMs);
+      }
+    }
+
     static void RunPlay(NetworkStream net) {
       var provider = new AdaptivePlayout();
       var policy = new ArrivalPolicy();
       var classifier = new SourceClassifier();
-      var spanBuf = new SourceSpan[256];
-      var ops = new ProviderOp[1024];        // <= 3 ops per span, preallocated
-      long sourceTransitionId = 0, providerBatchId = 0;
       OutputChain chain = null;
       byte[] tmp = new byte[SourceFmt.AverageBytesPerSecond / 20]; // ~50ms
       var assembler = new FrameAssembler(tmp.Length);
+      var ctx = new ReadContext {
+        Provider = provider, Policy = policy, Classifier = classifier, Assembler = assembler,
+        Spans = new SourceSpan[256], Ops = new ProviderOp[1024], Gain = gGain,
+      };
       long intervalBytes = 0, lastRead = 0, lastHardRebuffer = 0;
       long lastWatchdogTicks = 0;
       long watchdogTicks = Stopwatch.Frequency * 5;   // endpoint-drift check, 5 s
@@ -1620,80 +1689,35 @@ namespace AudioBridge {
           // Assemble WITHOUT gain: classification must read source PCM, so that a low
           // playback gain can never make program audio look like silence (R10). Gain is
           // applied per span, and only to spans that will actually be inserted.
-          int complete = assembler.Assemble(tmp, n);
-
-          // A 1-3 byte read carries no media. Letting it reach the policy moved the arrival
-          // clock, opened epochs, consumed a telemetry measurement and took part in the cold-open
-          // decision -- making all of that depend on how TCP happened to chop the stream, which
-          // is the exact dependence this design exists to remove. The interval simply continues
-          // until a complete frame lands.
+          ctx.OutputOpen = chain != null;
+          ProcessRead(ctx, tmp, n, readTicks, gapStartedConfirmed, provider.RatioSnapshot);
+          int complete = ctx.LastCompleteBytes;
           if (!ReadCarriesMedia(complete)) {
             lock (telemetryGate) { intervalBytes += n; }
             continue;
           }
 
-          // The gap in FRONT of this read is judged by the state that existed before the
-          // read blocked -- never by what the returning bytes turn out to contain.
-          policy.OnGap(readTicks, gapStartedConfirmed, provider.RatioSnapshot);
-
-          // Build ONE ordered batch for this read. Nothing reaches the provider until the whole
-          // tuple is ready, so the render callback cannot observe resumed state without its
-          // audio, or a threshold frame whose boundary has not been installed yet.
-          int spanCount = classifier.Scan(assembler.Buffer_, 0, complete, spanBuf);
-          int opCount = 0;
-          bool coldClear = false;
-          for (int si = 0; si < spanCount; si++) {
-            int frames = spanBuf[si].Bytes / SquelchProfile.FrameBytes;
-            // Resume happens BEFORE its own frames are handled: the talkspurt's first frame
-            // must not repay debt from the interval that was excused.
-            if (spanBuf[si].Edge == SourceEdge.Resumed) {
-              policy.ResumeDebt(readTicks);
-              policy.AdoptArmed(provider.BufferedFrames, true);
-              ops[opCount].Kind = OpKind.AdoptTarget; ops[opCount].TargetMs = policy.PrebufferMs; opCount++;
-              ops[opCount].Kind = OpKind.Talkspurt; ops[opCount].TransitionId = ++sourceTransitionId; opCount++;
-            }
-            if (spanBuf[si].Insert) {
-              if (gGain != 1.0f) ApplyGain(assembler.Buffer_, spanBuf[si].Offset, spanBuf[si].Bytes, gGain);
-              ops[opCount].Kind = OpKind.Pcm;
-              ops[opCount].Offset = spanBuf[si].Offset; ops[opCount].Bytes = spanBuf[si].Bytes; opCount++;
-            }
-            policy.OnMedia(readTicks, frames, spanBuf[si].Active);
-            // The threshold frame is media and is already in the batch ahead of this boundary;
-            // only now does the source count as confirmed.
-            if (spanBuf[si].Edge == SourceEdge.Confirmed) {
-              policy.SuspendDebt(readTicks);
-              policy.ApplyIdleTarget(provider.RequestQuantumFrames);
-              ops[opCount].Kind = OpKind.AdoptTarget; ops[opCount].TargetMs = policy.PrebufferMs; opCount++;
-              if (chain != null) {
-                ops[opCount].Kind = OpKind.IdleStart; ops[opCount].TransitionId = ++sourceTransitionId; opCount++;
-              } else coldClear = true;
-            }
-          }
-          provider.Commit(assembler.Buffer_, ops, opCount, ++providerBatchId);
-          // With the output closed nothing is rendering, so this needs no atomicity.
-          if (coldClear) { provider.ClearForColdStart(); policy.ResetColdObservation(); }
-          if (!classifier.Confirmed && spanCount > 0) {
-            if (policy.AdoptArmed(provider.BufferedFrames, false)) provider.PublishTarget(policy.PrebufferMs);
-          }
-          // A hard rebuffer is the design's other adoption point, and the load-bearing one:
-          // on a degrading path occupancy never reaches a raised target by itself, so
-          // waiting for it meant the receiver could measure that it needed a bigger buffer
-          // and never take it -- 14 rebuffers in 22 s while the raise sat armed. We are
-          // already paying the interruption, so take it here.
+          // A hard rebuffer is the design's other adoption point, and the load-bearing one: on a
+          // degrading path occupancy never reaches a raised target by itself, so waiting for it
+          // meant the receiver could measure that it needed a bigger buffer and never take it --
+          // 14 rebuffers in 22 s with the raise sitting armed. We are already paying the
+          // interruption, so take it here.
           long hardNow = provider.HardRebufferCount;
           if (hardNow != lastHardRebuffer) {
             lastHardRebuffer = hardNow;
             if (policy.AdoptArmed(provider.BufferedFrames, true)) provider.PublishTarget(policy.PrebufferMs);
           }
+
           // Recompute runs HERE, on the thread that owns the policy, once per published
-          // measurement (~1 s). Placed after the adoption points above so it sees the state they
-          // just produced, and after the read so the target reflects this block's arrival.
+          // measurement (~1 s). Placed after the adoption point above so it sees the state that
+          // produced, and after the read so the target reflects this block's arrival.
           int measQuantum; bool measUnderrun;
           if (exchange.TakeMeasurement(out measQuantum, out measUnderrun)) {
             policy.Recompute(readTicks, measQuantum, measUnderrun);
             provider.PublishTarget(policy.PrebufferMs);
             exchange.PublishDescription(policy.Describe());
           }
+
           lock (telemetryGate) {
             intervalBytes += n;
             if (lastRead != 0 && readAt - lastRead > maxReadGapMs) maxReadGapMs = readAt - lastRead;
@@ -1818,25 +1842,37 @@ namespace AudioBridge {
       }
     }
 
-    // DriveRead mirrors the read loop's ordering exactly: latch the gap verdict BEFORE the
-    // read, charge the gap, then walk the spans in stream order, resuming before a talkspurt's
-    // own frames and confirming only after the threshold frame has been counted as media.
+    // DriveRead now calls the PRODUCTION read processor. It used to reproduce the loop's ordering
+    // by hand, which meant an ordering change in RunPlay was invisible to every test.
     static void DriveRead(ArrivalPolicy pol, SourceClassifier cls, SourceSpan[] spans,
                           long atTicks, byte[] pcm, int offset, int bytes) {
-      bool gapStartedConfirmed = cls.Confirmed;
-      pol.OnGap(atTicks, gapStartedConfirmed, 1.0);
-      int n = cls.Scan(pcm, offset, bytes, spans);
-      for (int i = 0; i < n; i++) {
-        if (spans[i].Edge == SourceEdge.Resumed) pol.ResumeDebt(atTicks);
-        pol.OnMedia(atTicks, spans[i].Bytes / SquelchProfile.FrameBytes, spans[i].Active);
-        if (spans[i].Edge == SourceEdge.Confirmed) pol.SuspendDebt(atTicks);
-      }
+      var ctx = DriveContext(pol, cls, spans);
+      ctx.OutputOpen = false;
+      byte[] slice = new byte[bytes];
+      Array.Copy(pcm, offset, slice, 0, bytes);
+      ProcessRead(ctx, slice, bytes, atTicks, cls.Confirmed, 1.0);
     }
 
-    // The suite must assert its own INVENTORY, not just its result. Four cases were silently
-    // deleted during this build by wholesale region replacement, and the suite kept reporting ok
-    // throughout, because a deleted test cannot fail. Every case registers by name and the run
-    // fails if the set ever differs from ExpectedCases -- so losing one is as loud as breaking one.
+    // One context per (policy, classifier) pair so state persists across reads within a case.
+    static readonly System.Collections.Generic.Dictionary<ArrivalPolicy, ReadContext> driveCtx =
+      new System.Collections.Generic.Dictionary<ArrivalPolicy, ReadContext>();
+    static ReadContext DriveContext(ArrivalPolicy pol, SourceClassifier cls, SourceSpan[] spans) {
+      ReadContext c;
+      if (!driveCtx.TryGetValue(pol, out c)) {
+        c = new ReadContext {
+          Provider = new AdaptivePlayout(), Policy = pol, Classifier = cls,
+          Assembler = new FrameAssembler(1 << 20), Spans = spans, Ops = new ProviderOp[1024],
+        };
+        driveCtx[pol] = c;
+      }
+      return c;
+    }
+
+    // The suite must assert its own INVENTORY, not just its result. Cases were silently deleted
+    // during this build by wholesale region replacement, and the suite kept reporting ok, because
+    // a deleted test cannot fail. Every case registers by name and the run fails if the set ever
+    // differs -- so losing one is as loud as breaking one. (This harness itself was deleted the
+    // same way once; the compiler caught that one.)
     static readonly System.Collections.Generic.List<string> ranCases =
       new System.Collections.Generic.List<string>();
     static void Case(string id) {
