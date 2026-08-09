@@ -51,7 +51,9 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist\lib | Out-Null
           Copy-Item windows\lib\NAudio.dll dist\lib
           foreach ($n in 'capture','play') {
-            & $csc /nologo /target:exe /out:"dist\lib\$n.exe" /r:"windows\lib\NAudio.dll" "windows\lib\$n.cs"
+            $src = @("windows\lib\$n.cs")
+            if ($n -eq 'play') { $src += "windows\lib\SquelchProfile.cs" }
+            & $csc /nologo /target:exe /out:"dist\lib\$n.exe" /r:"windows\lib\NAudio.dll" $src
           }
           Copy-Item build\bin\hearken.exe dist\
           Compress-Archive -Path dist\* -DestinationPath hearken-windows.zip -Force

@@ -26,8 +26,11 @@ Write-Host "== 1/5  NAudio + compile capture.exe / play.exe ==" -ForegroundColor
 Copy-Item "$repo\windows\lib\NAudio.dll" $lib -Force
 $csc = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
 if (-not (Test-Path $csc)) { throw ".NET Framework 4.x not found ($csc). Install .NET Framework 4.8." }
+# play.exe also compiles the generated squelch-profile binding; capture.exe does not use it yet.
 foreach ($name in 'capture','play') {
-  & $csc /nologo /target:exe /out:"$lib\$name.exe" /r:"$lib\NAudio.dll" "$repo\windows\lib\$name.cs"
+  $sources = @("$repo\windows\lib\$name.cs")
+  if ($name -eq 'play') { $sources += "$repo\windows\lib\SquelchProfile.cs" }
+  & $csc /nologo /target:exe /out:"$lib\$name.exe" /r:"$lib\NAudio.dll" $sources
   Write-Host "  built $lib\$name.exe"
 }
 
