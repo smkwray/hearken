@@ -63,6 +63,14 @@ else
   git diff --check || violations=$((violations + 1))
 fi
 
+# Generated squelch-profile bindings must match profile/squelch.profile. Parallel hand-written
+# constants in Swift and C# can silently disagree, and disagreement is unsafe in one direction:
+# a receiver confirming silence sooner than the sender suppresses forgives real transport stalls.
+if ! python3 scripts/gen-squelch-profile.py --check; then
+  echo "hygiene_check: FAIL - squelch profile bindings are stale" >&2
+  violations=$((violations + 1))
+fi
+
 if [[ "$violations" -gt 0 ]]; then
   echo "hygiene_check: FAIL ($violations violation(s), $warnings warning(s))" >&2
   exit 1

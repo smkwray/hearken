@@ -983,6 +983,119 @@ namespace AudioBridge {
 
     // TCP can split a sample or stereo frame at any byte. Carry the incomplete
     // tail so gain and ring insertion always receive whole four-byte frames.
+    // What a run of assembled frames is, and what must happen to it.
+    enum SourceEdge { None, Confirmed, Resumed }
+
+    struct SourceSpan {
+      public int Offset;        // byte offset into the assembled block, frame-aligned
+      public int Bytes;         // length, frame-aligned
+      public bool Insert;       // false only for confirmed-squelch silence (heartbeats)
+      public bool PaysDebt;     // true while unconfirmed or qualifying: it is transmitted media
+      public SourceEdge Edge;   // a transition occurring AT this span's first frame
+    }
+
+    // SourceClassifier walks complete stereo frames in stream order and reports where the source
+    // crosses into confirmed squelch and back out.
+    //
+    // It replaces a whole-read peak plus a "was the last read silent" latch. TCP read boundaries
+    // are arbitrary -- this file already carries split frames across reads -- so any decision
+    // keyed on the shape of a read made the network's framing into policy. One silent quantum
+    // could forgive a real transport stall. A contiguous run of silent FRAMES is a property of
+    // the media itself and survives any fragmentation or coalescing.
+    //
+    // Confirmation lands on frame ConfirmFrames (12,000). That threshold frame is ordinary
+    // transmitted media and is still inserted; only what follows it is discardable.
+    class SourceClassifier {
+      int silentRun;
+      bool confirmed;
+
+      public bool Confirmed { get { return confirmed; } }
+      public int SilentRun { get { return silentRun; } }
+
+      // A new connection must observe a fresh qualifying tail before it may confirm anything;
+      // carrying confirmation across a reconnect would excuse the first gap of a new stream.
+      public void Reset() { silentRun = 0; confirmed = false; }
+
+      // Scan splits [offset, offset+bytes) into runs. Returns the number of spans written.
+      // Pure: no clock, no socket, no ring. `spans` must hold at least 4 entries per frame
+      // boundary the caller expects; in practice a block alternates rarely, and the caller
+      // flushes when full.
+      public int Scan(byte[] b, int offset, int bytes, SourceSpan[] spans) {
+        int count = 0;
+        int i = 0;
+        int frames = bytes / SquelchProfile.FrameBytes;
+        while (i < frames) {
+          bool wasConfirmed = confirmed;
+          SourceEdge edge = SourceEdge.None;
+          int spanStart = i;
+
+          // Classify this frame, then extend the span while classification is unchanged.
+          int at = offset + i * SquelchProfile.FrameBytes;
+          bool silent = FrameIsSilent(b, at);
+
+          if (confirmed && !silent) { confirmed = false; silentRun = 0; edge = SourceEdge.Resumed; }
+          else if (!confirmed) {
+            if (!silent) silentRun = 0;
+            else {
+              silentRun++;
+              if (silentRun >= SquelchProfile.ConfirmFrames) {
+                // The threshold frame itself is media. Emit it as an inserted, debt-paying span
+                // of exactly one frame carrying the Confirmed edge, so the caller can place the
+                // idle boundary immediately after it.
+                confirmed = true;
+                edge = SourceEdge.Confirmed;
+                if (count < spans.Length) {
+                  spans[count].Offset = at;
+                  spans[count].Bytes = SquelchProfile.FrameBytes;
+                  spans[count].Insert = true;
+                  spans[count].PaysDebt = true;
+                  spans[count].Edge = edge;
+                  count++;
+                }
+                i++;
+                continue;
+              }
+            }
+          }
+
+          // Extend while the frame's disposition matches this span's.
+          bool spanConfirmed = confirmed;
+          int j = i + 1;
+          while (j < frames) {
+            int aj = offset + j * SquelchProfile.FrameBytes;
+            bool sj = FrameIsSilent(b, aj);
+            if (spanConfirmed) {
+              if (!sj) break;                              // resume ends a confirmed span
+            } else {
+              if (sj) {
+                if (silentRun + 1 >= SquelchProfile.ConfirmFrames) break;   // threshold ends it
+                silentRun++;
+              } else silentRun = 0;
+            }
+            j++;
+          }
+
+          if (count < spans.Length) {
+            spans[count].Offset = offset + spanStart * SquelchProfile.FrameBytes;
+            spans[count].Bytes = (j - spanStart) * SquelchProfile.FrameBytes;
+            spans[count].Insert = !spanConfirmed;
+            spans[count].PaysDebt = !spanConfirmed;
+            spans[count].Edge = edge;
+            count++;
+          }
+          i = j;
+          if (count >= spans.Length) break;
+        }
+        return count;
+      }
+
+      static bool FrameIsSilent(byte[] b, int at) {
+        short l = (short)(b[at] | (b[at + 1] << 8));
+        short r = (short)(b[at + 2] | (b[at + 3] << 8));
+        return SquelchProfile.FrameIsSilent(l, r);
+      }
+    }
+
     class FrameAssembler {
       readonly byte[] joined;
       readonly byte[] tail = new byte[4];
@@ -1373,6 +1486,45 @@ namespace AudioBridge {
       }
     }
 
+    // BuildStream lays out [activeBefore][silent][activeAfter] stereo frames. Silent frames sit
+    // at the inclusive threshold (both channels == SilencePeak) so the test also pins the
+    // comparison as <=, not <.
+    static byte[] BuildStream(int activeBefore, int silent, int activeAfter) {
+      int frames = activeBefore + silent + activeAfter;
+      byte[] b = new byte[frames * SquelchProfile.FrameBytes];
+      for (int f = 0; f < frames; f++) {
+        bool quiet = f >= activeBefore && f < activeBefore + silent;
+        short v = quiet ? SquelchProfile.SilencePeak : (short)3000;
+        int at = f * SquelchProfile.FrameBytes;
+        b[at] = (byte)(v & 0xff); b[at + 1] = (byte)((v >> 8) & 0xff);
+        b[at + 2] = (byte)(v & 0xff); b[at + 3] = (byte)((v >> 8) & 0xff);
+      }
+      return b;
+    }
+
+    // ClassifyStream feeds one stream through a fresh classifier in fixed-size frame chunks
+    // (0 = one call) and reports the transitions by ABSOLUTE frame index. Identical audio must
+    // produce identical indices for every chunk shape; that is the whole point.
+    static void ClassifyStream(int activeBefore, int silent, int activeAfter, int framesPerChunk,
+                               out int confirms, out int resumes, out int confirmAt, out int resumeAt) {
+      byte[] b = BuildStream(activeBefore, silent, activeAfter);
+      var c = new SourceClassifier();
+      var spans = new SourceSpan[512];
+      confirms = resumes = 0; confirmAt = resumeAt = -1;
+      int totalFrames = b.Length / SquelchProfile.FrameBytes;
+      int step = framesPerChunk <= 0 ? totalFrames : framesPerChunk;
+      for (int f = 0; f < totalFrames; ) {
+        int take = Math.Min(step, totalFrames - f);
+        int n = c.Scan(b, f * SquelchProfile.FrameBytes, take * SquelchProfile.FrameBytes, spans);
+        for (int i = 0; i < n; i++) {
+          int absFrame = spans[i].Offset / SquelchProfile.FrameBytes;
+          if (spans[i].Edge == SourceEdge.Confirmed) { confirms++; confirmAt = absFrame; }
+          else if (spans[i].Edge == SourceEdge.Resumed) { resumes++; resumeAt = absFrame; }
+        }
+        f += take;
+      }
+    }
+
     static void RunSelfTest() {
       var splitProvider = new AdaptivePlayout();
       var assembler = new FrameAssembler(8);
@@ -1574,6 +1726,73 @@ namespace AudioBridge {
       if (ShouldReconcileOnStop(liveChain))
         throw new Exception("our own teardown must not re-arm reconciliation (the reopen storm)");
       activeEndpointId = null;
+
+      // ---- SourceClassifier: R1 exact boundary, R5 read-shape invariance ----------------
+      // The defect being replaced decided source silence from a whole-read peak and a
+      // "was the last read silent" latch, so ONE silent quantum could forgive a real transport
+      // stall, and the verdict changed with how TCP happened to chop the stream.
+      {
+        // frames: [activeBefore][silent][activeAfter], classified in several chunk shapes.
+        const int activeBefore = 100, activeAfter = 50;
+        int[] chunkShapes = new int[] { 1, 2, 3, 7, 257, 4096, 0 };   // frames per Scan call; 0 = all
+
+        // 11,999 silent frames must NOT confirm, whatever the chunking.
+        foreach (int shape in chunkShapes) {
+          int confirms, resumes, confirmAt, resumeAt;
+          ClassifyStream(activeBefore, SquelchProfile.ConfirmFrames - 1, activeAfter, shape,
+            out confirms, out resumes, out confirmAt, out resumeAt);
+          if (confirms != 0)
+            throw new Exception("11,999 silent frames must remain qualifying, not confirm");
+        }
+
+        // The 12,000th silent frame confirms exactly once, at the same absolute frame index
+        // for every chunking, and resume lands on the first active frame after it.
+        int expectConfirm = activeBefore + SquelchProfile.ConfirmFrames - 1;
+        int expectResume = activeBefore + SquelchProfile.ConfirmFrames;
+        foreach (int shape in chunkShapes) {
+          int confirms, resumes, confirmAt, resumeAt;
+          ClassifyStream(activeBefore, SquelchProfile.ConfirmFrames, activeAfter, shape,
+            out confirms, out resumes, out confirmAt, out resumeAt);
+          if (confirms != 1)
+            throw new Exception("frame 12,000 must confirm exactly once, got " + confirms);
+          if (confirmAt != expectConfirm)
+            throw new Exception("confirmation landed on frame " + confirmAt + ", expected " +
+              expectConfirm + " (chunk shape " + shape + ") - read shape must not move it");
+          if (resumes != 1 || resumeAt != expectResume)
+            throw new Exception("resume must land exactly on the first active frame after silence");
+        }
+
+        // A silent run broken by one active frame must restart, never accumulate.
+        {
+          var c = new SourceClassifier();
+          var spans = new SourceSpan[64];
+          byte[] half = BuildStream(0, SquelchProfile.ConfirmFrames / 2, 1);   // silence then 1 active
+          c.Scan(half, 0, half.Length, spans);
+          if (c.Confirmed) throw new Exception("half a qualifying run must not confirm");
+          if (c.SilentRun != 0) throw new Exception("an active frame must reset the silent run");
+          byte[] second = BuildStream(0, SquelchProfile.ConfirmFrames / 2, 0);
+          c.Scan(second, 0, second.Length, spans);
+          if (c.Confirmed)
+            throw new Exception("two half-runs split by program must not add up to a confirmation");
+        }
+
+        // Confirmed silence is discarded, not inserted: a heartbeat must never become program.
+        {
+          var c = new SourceClassifier();
+          var spans = new SourceSpan[64];
+          byte[] tail = BuildStream(0, SquelchProfile.ConfirmFrames + 480, 0);
+          int n = c.Scan(tail, 0, tail.Length, spans);
+          if (!c.Confirmed) throw new Exception("a full qualifying tail must confirm");
+          bool sawDiscard = false;
+          for (int i = 0; i < n; i++) {
+            if (spans[i].Edge == SourceEdge.Confirmed && !spans[i].Insert)
+              throw new Exception("the threshold frame is media and must still be inserted");
+            if (!spans[i].Insert) { sawDiscard = true; if (spans[i].PaysDebt)
+              throw new Exception("confirmed silence must not pay down arrival debt"); }
+          }
+          if (!sawDiscard) throw new Exception("silence past the threshold must be discarded");
+        }
+      }
 
       // The measurement handoff that removes the ArrivalPolicy race. The quantum may be
       // overwritten between reads, but a dropped underrun would hide a real starvation from the
