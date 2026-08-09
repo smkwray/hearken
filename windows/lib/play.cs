@@ -472,6 +472,15 @@ namespace AudioBridge {
       }
     }
 
+    // Where the source crossed, expressed as a position in the audio itself.
+    enum RenderMode { ActivePlaying, DrainToIdle, IdleSilence, ResumePrebuffer }
+    enum MarkerKind { IdleStart, TalkspurtStart }
+    struct TimelineMarker {
+      public MarkerKind Kind;
+      public long Serial;        // absolute frame serial the boundary sits immediately before
+      public long TransitionId;  // monotonic; a repeated or stale id is rejected
+    }
+
     // Fixed-capacity, frame-counted PCM ring plus a narrow fractional provider.
     // The render callback performs only bounded arithmetic and copies under one
     // short lock: no allocation, logging, socket I/O, or unbounded drain loop.
@@ -501,9 +510,20 @@ namespace AudioBridge {
       double gapP50Ms, gapP95Ms, gapP99Ms;
 
       int head, frames;
+      // Absolute frame serials. The ring index alone cannot express "the boundary is 300 ms of
+      // audio further on", which is exactly what a marker has to mean.
+      long writeSerial, readSerial, resumeAnchorSerial;
+      // 2 * ceil(CapacityFrames / ConfirmFrames) covers the most boundaries a full ring can hold
+      // at the minimum silence cycle, plus margin. Fixed, so the render path stays bounded.
+      const int MarkerCapacity = 32;
+      readonly TimelineMarker[] markers = new TimelineMarker[MarkerCapacity];
+      int markerHead, markerCount;
+      long lastTransitionId, markerOverflows, markersCrossedIdle, markersCrossedTalk;
+      long idleSilenceFrames, resumeWaitFrames;
+      RenderMode mode = RenderMode.ActivePlaying;
       double phase, ratio = 1.0, integralMsSeconds;
       long lastControlTicks, lastCallbackTicks, softUnderrunTicks;
-      bool pendingDiscontinuity, rebuffering = true, idle, softPending;
+      bool pendingDiscontinuity, rebuffering = true, softPending;
       int transitionRemaining;
       short transitionFromL, transitionFromR, lastL, lastR;
 
@@ -537,6 +557,11 @@ namespace AudioBridge {
       public long SoftUnderrunCount { get { lock (gate) { return softUnderruns; } } }
       public long HardRebufferCount { get { lock (gate) { return hardRebuffers; } } }
       public long FreshnessTrimCount { get { lock (gate) { return freshnessTrims; } } }
+      public int RenderModeForTest { get { lock (gate) { return (int)mode; } } }
+      public long IdleSilenceFrames { get { lock (gate) { return idleSilenceFrames; } } }
+      public long ResumeWaitFrames { get { lock (gate) { return resumeWaitFrames; } } }
+      public long MarkersCrossedIdleForTest { get { lock (gate) { return markersCrossedIdle; } } }
+      public long SuppliedFramesForTest { get { lock (gate) { return suppliedFrames; } } }
       public long FreshnessTrimTransitionCount { get { lock (gate) { return freshnessTrimsOutage; } } }
       // Bracket a deliberate endpoint teardown so any discard inside it is attributed to the
       // outage. Both take the same lock the render callback uses, so the flag can never be
@@ -558,6 +583,7 @@ namespace AudioBridge {
         if (n > frames) n = frames;
         head = (head + n) % CapacityFrames;
         frames -= n;
+        readSerial += n;
       }
 
       // PublishTarget hands the render callback a new operating point. The callback
@@ -571,17 +597,57 @@ namespace AudioBridge {
         }
       }
 
-      public void SetIdle(bool value) {
+      // MarkIdleStart / MarkTalkspurt place a boundary AT THE CURRENT WRITE POSITION, which is
+      // the whole point: playback lags the network, so the sender can already have resumed while
+      // WASAPI is still rendering audio from before the silence. A live Boolean would cut the
+      // tail off the previous phrase. A marker crosses when playback actually reaches it.
+      //
+      // The transition id makes both idempotent: a repeated heartbeat, or a retried batch, must
+      // not add a second boundary or duplicate a talkspurt.
+      public bool MarkIdleStart(long transitionId) {
         lock (gate) {
-          if (idle == value) return;
-          idle = value;
-          if (idle) {
-            // Squelch is not an underrun. Stop the controller, keep the ring, and be
-            // ready to prebuffer cleanly when program audio returns.
-            integralMsSeconds = 0;
-            rebuffering = true;
-            softPending = false;
-          }
+          if (transitionId <= lastTransitionId) return false;
+          lastTransitionId = transitionId;
+          if (!PushMarkerLocked(MarkerKind.IdleStart, writeSerial, transitionId)) return false;
+          // Deliberately NOT rebuffering = true. That gate holds a below-target ring and would
+          // keep pre-silence program audio back to be played late; drain must ignore the target
+          // and render what is already here.
+          integralMsSeconds = 0;
+          softPending = false;
+          if (mode == RenderMode.ActivePlaying) mode = RenderMode.DrainToIdle;
+          return true;
+        }
+      }
+      public bool MarkTalkspurt(long transitionId) {
+        lock (gate) {
+          if (transitionId <= lastTransitionId) return false;
+          lastTransitionId = transitionId;
+          return PushMarkerLocked(MarkerKind.TalkspurtStart, writeSerial, transitionId);
+        }
+      }
+
+      bool PushMarkerLocked(MarkerKind kind, long serial, long id) {
+        if (markerCount >= MarkerCapacity) {
+          // Never render ambiguously ordered PCM: collapse to the newest boundary instead.
+          markerOverflows++;
+          markerHead = markerCount = 0;
+          mode = kind == MarkerKind.IdleStart ? RenderMode.DrainToIdle : RenderMode.ResumePrebuffer;
+        }
+        int at = (markerHead + markerCount) % MarkerCapacity;
+        markers[at].Kind = kind; markers[at].Serial = serial; markers[at].TransitionId = id;
+        markerCount++;
+        return true;
+      }
+
+      // Apply every boundary playback has actually reached, in order. Called from the render
+      // path and after a trim, because a trim advances the read position across markers too.
+      void ConsumeDueMarkersLocked() {
+        while (markerCount > 0 && markers[markerHead].Serial <= readSerial) {
+          MarkerKind k = markers[markerHead].Kind;
+          markerHead = (markerHead + 1) % MarkerCapacity;
+          markerCount--;
+          if (k == MarkerKind.IdleStart) { mode = RenderMode.IdleSilence; markersCrossedIdle++; }
+          else { mode = RenderMode.ResumePrebuffer; resumeAnchorSerial = readSerial; markersCrossedTalk++; }
         }
       }
 
@@ -657,6 +723,7 @@ namespace AudioBridge {
             int fromInput = excess - fromRing;
             if (fromInput > add) fromInput = add;
             if (fromInput > 0) { offset += fromInput * FrameBytes; add -= fromInput; }
+            if (fromRing > 0) ConsumeDueMarkersLocked();   // a trim crosses boundaries too
             if (fromRing + fromInput > 0) {
               freshnessTrims++;
               freshnessTrimFrames += fromRing + fromInput;
@@ -679,6 +746,7 @@ namespace AudioBridge {
           Buffer.BlockCopy(input, offset, ring, tail * FrameBytes, first * FrameBytes);
           if (first < add) Buffer.BlockCopy(input, offset + first * FrameBytes, ring, 0, (add - first) * FrameBytes);
           frames += add;
+          writeSerial += add;
           lastWriteAfterFrames = frames;
           NoteOccupancy();
         }
@@ -817,15 +885,64 @@ namespace AudioBridge {
           }
           lastCallbackTicks = now;
           AdoptTargetLocked();
+          ConsumeDueMarkersLocked();
 
           int needed = (int)Math.Ceiling(outputFrames * ratio) + 1;
 
-          // Source squelched: render silence without charging an underrun. The listener
-          // is meant to hear nothing, so nothing here is a fault to count or recover from.
-          if (idle && frames < needed) {
-            WriteSilence(output, offset, count, outputFrames);
+          // --- source timeline ------------------------------------------------------------
+          // DRAIN_TO_IDLE: the source is confirmed silent but the audio it sent before going
+          // quiet is still in the ring and belongs to the listener. Render it out regardless of
+          // the prebuffer target -- deliberately NOT through the rebuffer gate, which would hold
+          // a below-target ring and replay that tail late -- and stop exactly on the boundary.
+          if (mode == RenderMode.DrainToIdle) {
+            long toBoundary = markerCount > 0 ? markers[markerHead].Serial - readSerial : 0;
+            if (toBoundary < 0) toBoundary = 0;
+            int drainable = (int)(toBoundary / (ratio > 0 ? ratio : 1.0));
+            if (drainable > outputFrames) drainable = outputFrames;
+            if (drainable > 0 && frames > 1) {
+              int byOccupancy = (int)((frames - 1) / (ratio > 0 ? ratio : 1.0));
+              if (drainable > byOccupancy) drainable = byOccupancy;
+            } else drainable = 0;
+            Array.Clear(output, offset, count);
+            if (drainable > 0) {
+              RenderFrames(output, offset, drainable);
+              suppliedFrames += drainable;
+            }
+            ConsumeDueMarkersLocked();
+            // The interpolator needs one frame of lookahead, so it can never consume the final
+            // frame before the boundary and the drain would stall a frame short forever, never
+            // crossing. Once no further progress is possible, step over the residue -- at most
+            // one frame, ~21 microseconds -- so the boundary is actually reached.
+            if (mode == RenderMode.DrainToIdle && drainable == 0 && markerCount > 0) {
+              long residue = markers[markerHead].Serial - readSerial;
+              if (residue > 0 && residue <= 2) { Advance((int)residue); ConsumeDueMarkersLocked(); }
+            }
             NoteOccupancy();
             return count;
+          }
+
+          // IDLE_SILENCE: the listener is meant to hear nothing. Not an underrun, not a
+          // rebuffer, and no reason to touch the controller.
+          if (mode == RenderMode.IdleSilence) {
+            WriteSilence(output, offset, count, outputFrames);
+            idleSilenceFrames += outputFrames;
+            NoteOccupancy();
+            return count;
+          }
+
+          // RESUME_PREBUFFER: the talkspurt boundary has been crossed; withhold until a full
+          // target of post-boundary audio exists, then fade in ONCE. Zero-fill here is
+          // intentional and must never be charged as starvation.
+          if (mode == RenderMode.ResumePrebuffer) {
+            long since = writeSerial - resumeAnchorSerial;
+            if (since < prebufferFrames || frames < needed) {
+              WriteSilence(output, offset, count, outputFrames);
+              resumeWaitFrames += outputFrames;
+              NoteOccupancy();
+              return count;
+            }
+            mode = RenderMode.ActivePlaying;
+            BeginFadeIn(0, 0);
           }
 
           if (rebuffering) {
@@ -919,7 +1036,7 @@ namespace AudioBridge {
         long callbackGaps, requested, supplied, softs, softZeros, hards, hardFrames;
         long overflows, overflowedFrames, trims, trimmedFrames, playedSourceFrames;
         long outageTrims, outageTrimFrames;
-        bool rebuf, idleNow;
+        bool rebuf; int modeNow; long ovf, crossIdle, crossTalk, idleFrames, waitFrames;
         lock (gate) {
           ratioPpm = (ratio - 1.0) * 1000000.0;
           occupancyMs = Audio.Ms(frames);
@@ -946,7 +1063,9 @@ namespace AudioBridge {
           r50 = Audio.Ms(reqP50Frames); r95 = Audio.Ms(reqP95Frames); r99 = Audio.Ms(reqP99Frames);
           g50 = gapP50Ms; g95 = gapP95Ms; g99 = gapP99Ms;
           rebuf = rebuffering;
-          idleNow = idle;
+          modeNow = (int)mode; ovf = markerOverflows;
+          crossIdle = markersCrossedIdle; crossTalk = markersCrossedTalk;
+          idleFrames = idleSilenceFrames; waitFrames = resumeWaitFrames;
           maxCallbackGapMs = 0;
           minOccupancy = maxOccupancy = frames;
         }
@@ -966,7 +1085,9 @@ namespace AudioBridge {
           "callback_gap_p50_ms={37:0.0} callback_gap_p95_ms={38:0.0} callback_gap_p99_ms={39:0.0} " +
           "device_buffer_ms={40} " +
           "freshness_trim_output_transition={41} freshness_trim_output_transition_ms={42:0.0} " +
-          "output_notify_accepted={43} output_notify_ignored={44} output_reconcile_noop={45}",
+          "output_notify_accepted={43} output_notify_ignored={44} output_reconcile_noop={45} " +
+          "render_mode_state={46} marker_idle_crossed={47} marker_talkspurt_crossed={48} " +
+          "marker_overflow={49} idle_silence_ms={50:0.0} resume_wait_ms={51:0.0}",
           rxBytes, rxDurationMs, maxReadGapMs, occupancyMs,
           writeBeforeMs, writeAfterMs, spanMs, callbackMaxGapMs, callbackGaps,
           quantumMs, prebufMs, requested, supplied,
@@ -979,7 +1100,9 @@ namespace AudioBridge {
           callbackMaxGapMs > 150.0 ? 1 : 0, spanMs > 100 ? 1 : 0,
           r50, r95, r99, g50, g95, g99, deviceBufferMs,
           outageTrims, outageTrimFrames * 1000.0 / SampleRate,
-          Interlocked.Read(ref notifyAccepted), Interlocked.Read(ref notifyIgnored), reconcileNoops);
+          Interlocked.Read(ref notifyAccepted), Interlocked.Read(ref notifyIgnored), reconcileNoops,
+          modeNow, crossIdle, crossTalk, ovf,
+          idleFrames * 1000.0 / SampleRate, waitFrames * 1000.0 / SampleRate);
       }
     }
 
@@ -1297,6 +1420,7 @@ namespace AudioBridge {
       var policy = new ArrivalPolicy();
       var classifier = new SourceClassifier();
       var spanBuf = new SourceSpan[256];
+      long sourceTransitionId = 0;
       OutputChain chain = null;
       byte[] tmp = new byte[SourceFmt.AverageBytesPerSecond / 20]; // ~50ms
       var assembler = new FrameAssembler(tmp.Length);
@@ -1366,12 +1490,11 @@ namespace AudioBridge {
             // must not repay debt from the interval that was excused.
             if (spanBuf[si].Edge == SourceEdge.Resumed) {
               policy.ResumeDebt(readTicks);
-              // INTERIM (Phase 1 step 5): the render timeline still swings on SetIdle. The
-              // spec requires a TALKSPURT_START marker so playback, which lags the network,
-              // crosses the boundary at the right frame instead of on a live Boolean.
-              provider.SetIdle(false);
               policy.AdoptArmed(provider.BufferedFrames, true);
+              // The target and the boundary are published before the talkspurt's own frames, so
+              // the render callback can never see resumed state without the audio behind it.
               provider.PublishTarget(policy.PrebufferMs);
+              provider.MarkTalkspurt(++sourceTransitionId);
             }
             if (spanBuf[si].Insert) {
               if (gGain != 1.0f) ApplyGain(assembler.Buffer_, spanBuf[si].Offset, spanBuf[si].Bytes, gGain);
@@ -1384,7 +1507,9 @@ namespace AudioBridge {
               policy.SuspendDebt(readTicks);
               policy.ApplyIdleTarget(provider.RequestQuantumFrames);
               provider.PublishTarget(policy.PrebufferMs);
-              provider.SetIdle(true);   // INTERIM (Phase 1 step 5): must become DRAIN_TO_IDLE
+              // Placed AFTER the threshold frame was inserted, so the boundary sits exactly
+              // where the source went quiet rather than wherever playback happens to be.
+              provider.MarkIdleStart(++sourceTransitionId);
             }
           }
           if (!classifier.Confirmed && spanCount > 0) {
@@ -1671,6 +1796,67 @@ namespace AudioBridge {
       }
       if (undersized.HardRebufferCount + undersized.SoftUnderrunCount == 0)
         throw new Exception("undersized target must starve, else the cadence test proves nothing");
+
+      // ---- render timeline: the boundary lives in the audio, not in a flag ---------------
+      // A1: audio the source sent BEFORE going quiet belongs to the listener. Draining must
+      // ignore the prebuffer target -- routing it through the ordinary rebuffer gate holds a
+      // below-target ring and replays that tail late, which is exactly the defect.
+      {
+        var prov = new AdaptivePlayout();
+        prov.PublishTarget(Audio.MinPrebufferMs);
+        int tail = Audio.Frames(15);                       // deliberately BELOW the 40 ms target
+        prov.AddFrames(MakeTone(tail), 0, tail * 4);
+        prov.MarkIdleStart(1);
+        byte[] outBuf = new byte[Audio.Frames(10) * 4];
+        for (int i = 0; i < 8; i++) prov.Read(outBuf, 0, outBuf.Length);
+        if (prov.SuppliedFramesForTest < tail - 2)
+          throw new Exception("drain must render the pre-silence tail regardless of the target, got " +
+            prov.SuppliedFramesForTest + " of " + tail);
+        if (prov.HardRebufferCount != 0 || prov.SoftUnderrunCount != 0)
+          throw new Exception("reaching a source boundary is not starvation");
+        if (prov.RenderModeForTest != (int)RenderMode.IdleSilence)
+          throw new Exception("crossing the idle boundary must enter idle silence");
+        if (prov.IdleSilenceFrames == 0)
+          throw new Exception("past the boundary the listener must get deliberate silence");
+      }
+
+      // A3: at the talkspurt boundary, withhold until a full target of POST-boundary audio
+      // exists, then fade in once. Zero-fill while waiting is intentional, not starvation.
+      {
+        var prov = new AdaptivePlayout();
+        prov.PublishTarget(Audio.MinPrebufferMs);
+        prov.MarkIdleStart(1);
+        byte[] outBuf = new byte[Audio.Frames(10) * 4];
+        prov.Read(outBuf, 0, outBuf.Length);               // cross into idle silence
+        prov.MarkTalkspurt(2);
+        int trickle = Audio.Frames(10);                    // a quarter of the target
+        prov.AddFrames(MakeTone(trickle), 0, trickle * 4);
+        prov.Read(outBuf, 0, outBuf.Length);
+        if (prov.RenderModeForTest != (int)RenderMode.ResumePrebuffer)
+          throw new Exception("a talkspurt boundary must enter resume prebuffer");
+        if (prov.SoftUnderrunCount != 0 || prov.HardRebufferCount != 0)
+          throw new Exception("waiting for the resume target must not be charged as starvation");
+        int rest = Audio.Frames(60);
+        prov.AddFrames(MakeTone(rest), 0, rest * 4);
+        prov.Read(outBuf, 0, outBuf.Length);
+        if (prov.RenderModeForTest != (int)RenderMode.ActivePlaying)
+          throw new Exception("a full target of post-boundary audio must resume playback");
+      }
+
+      // A6: boundaries are idempotent. A repeated heartbeat or a retried batch must not add a
+      // second boundary or duplicate a talkspurt.
+      {
+        var prov = new AdaptivePlayout();
+        prov.PublishTarget(Audio.MinPrebufferMs);
+        if (!prov.MarkIdleStart(7)) throw new Exception("a fresh transition id must be accepted");
+        if (prov.MarkIdleStart(7)) throw new Exception("a repeated transition id must be rejected");
+        if (prov.MarkIdleStart(3)) throw new Exception("a stale transition id must be rejected");
+        byte[] outBuf = new byte[Audio.Frames(10) * 4];
+        prov.Read(outBuf, 0, outBuf.Length);
+        if (prov.MarkersCrossedIdleForTest != 1)
+          throw new Exception("a duplicated boundary must not be crossed twice, crossed " +
+            prov.MarkersCrossedIdleForTest);
+      }
 
       // ---- arrival accounting, driven exactly as production drives it ------------------
       // These replace the old keepalive-era suite. Source state is no longer a Boolean this
