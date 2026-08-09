@@ -1151,6 +1151,19 @@ namespace AudioBridge {
     // Confirmation lands on frame ConfirmFrames (12,000). That threshold frame is ordinary
     // transmitted media and is still inserted; only what follows it is discardable.
     class SourceClassifier {
+      // Continuous PCM is the specified fallback if confirmed squelch cannot be trusted, and it
+      // is only safe as ONE coordinated mode: the sender stops suppressing AND the receiver stops
+      // forgiving. A sender-suppressed / receiver-charging pair inflates the target on every
+      // pause; a sender-continuous / receiver-forgiving pair would excuse real stalls. Both ends
+      // read the same BRIDGE_CONTINUOUS_PCM switch.
+      readonly bool forgivenessEnabled;
+      public SourceClassifier() : this(!ContinuousPcmRequested()) {}
+      public SourceClassifier(bool enableForgiveness) { forgivenessEnabled = enableForgiveness; }
+      public static bool ContinuousPcmRequested() {
+        return Environment.GetEnvironmentVariable("BRIDGE_CONTINUOUS_PCM") == "1";
+      }
+      public bool ForgivenessEnabled { get { return forgivenessEnabled; } }
+
       int silentRun;
       bool confirmed;
 
@@ -1183,7 +1196,7 @@ namespace AudioBridge {
             if (!silent) silentRun = 0;
             else {
               silentRun++;
-              if (silentRun >= SquelchProfile.ConfirmFrames) {
+              if (forgivenessEnabled && silentRun >= SquelchProfile.ConfirmFrames) {
                 // The threshold frame itself is media. Emit it as an inserted, debt-paying span
                 // of exactly one frame carrying the Confirmed edge, so the caller can place the
                 // idle boundary immediately after it.
@@ -1215,7 +1228,7 @@ namespace AudioBridge {
               if (!sj) break;                              // resume ends a confirmed span
             } else {
               if (sj) {
-                if (silentRun + 1 >= SquelchProfile.ConfirmFrames) break;   // threshold ends it
+                if (forgivenessEnabled && silentRun + 1 >= SquelchProfile.ConfirmFrames) break;
                 silentRun++;
               } else { silentRun = 0; sawActive = true; }
             }
@@ -1833,6 +1846,22 @@ namespace AudioBridge {
       }
       if (undersized.HardRebufferCount + undersized.SoftUnderrunCount == 0)
         throw new Exception("undersized target must starve, else the cadence test proves nothing");
+
+      // Continuous PCM must be one coordinated mode. With forgiveness off the receiver never
+      // confirms, so it never excuses a gap -- which is the only safe pairing with a sender that
+      // has stopped suppressing.
+      {
+        var off = new SourceClassifier(false);
+        var sp = new SourceSpan[64];
+        byte[] longSilence = BuildStream(0, SquelchProfile.ConfirmFrames * 2, 0);
+        off.Scan(longSilence, 0, longSilence.Length, sp);
+        if (off.Confirmed)
+          throw new Exception("with forgiveness disabled the receiver must never confirm squelch");
+        var on = new SourceClassifier(true);
+        on.Scan(longSilence, 0, longSilence.Length, sp);
+        if (!on.Confirmed)
+          throw new Exception("the same fixture must confirm with forgiveness on, else this proves nothing");
+      }
 
       // ---- render timeline: the boundary lives in the audio, not in a flag ---------------
       // A1: audio the source sent BEFORE going quiet belongs to the listener. Draining must
