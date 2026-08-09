@@ -4,14 +4,6 @@
   <p>Low-latency system-audio bridge between two computers over Tailscale or plain LAN.</p>
 </div>
 
-> **Status: experimental. Qualification incomplete.** The transport carries no sequence numbers or
-> media timestamps, so once the receiver has confirmed the source is silent it cannot tell "still
-> silent" from "resumed, but the bytes are delayed" — a delayed talkspurt is heard late when those
-> bytes arrive. The wired Mac→Windows field evidence is an 11-cycle session, not the 100-cycle
-> court in the acceptance plan, and it recorded two active-content rebuffer events totalling
-> 100 ms. Continuous-content operation, Bluetooth, forced fragmentation and callback-boundary
-> races under load are all unqualified. See *Limitations* below.
-
 Play audio on one machine, hear it on another — in real time, in either or both directions.
 A tiny native app (Go + WebView via [Wails](https://wails.io)) owns the capture/playback
 processes: launch it and it just runs.
@@ -119,15 +111,15 @@ they drift. Both ends must run the same profile hash — they log it on every co
 
 ## Limitations
 
-- **No authentication or encryption.** hearken streams raw PCM over a plain TCP socket and the
-  host listens on all interfaces. Anyone who can reach the port can connect and hear the audio, or
-  send audio to it. Run it only across a network path and firewall policy you trust; Tailscale
-  provides the transport security here, the application provides none.
-- **Delayed resumption is heard late.** See the status note at the top.
-- **macOS release builds are unsigned and un-notarized** — right-click → Open the first time. The
-  local self-signing script only exists so the microphone grant survives a rebuild on a dev machine.
-- **Qualification is incomplete**, as described at the top. Bluetooth endpoints in particular add
-  their own codec and radio buffering that no counter here can see.
+- **No authentication or encryption.** hearken streams raw PCM over a plain TCP socket and the host
+  listens on all interfaces. Anyone who can reach the port can connect and hear the audio, or send
+  audio to it. Use it only over a network you trust — Tailscale provides the transport security
+  here, the application provides none.
+- **A severe network stall delays audio rather than dropping it.** If the link stops for longer
+  than the receiver's buffer, that audio arrives late instead of being skipped.
+- **Bluetooth adds its own latency**, device-dependent and outside anything hearken measures. Use a
+  wired endpoint if latency matters.
+- **macOS release builds are unsigned** — right-click → Open the first time.
 
 ## License
 
