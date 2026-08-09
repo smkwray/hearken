@@ -512,8 +512,11 @@ namespace AudioBridge {
       int targetGeneration;
 
       long overflowEvents, overflowFrames, freshnessTrims, freshnessTrimFrames;
-      // Trims taken while the output endpoint is down are a device event, not the network
-      // running late. Kept separate so a reopen storm can never again read as a transport fault.
+      // Trims taken while the output endpoint is down -- during the FIRST open as much as a
+      // later reopen -- are a device event, not the network running late. Opening a WASAPI
+      // endpoint is not instant (a Bluetooth endpoint has to wake and negotiate), nothing
+      // drains the ring while it happens, and the backlog that builds is then discarded. Kept
+      // separate so neither a reopen storm nor a slow endpoint can read as a transport fault.
       long freshnessTrimsOutage, freshnessTrimFramesOutage;
       bool outputOutage;
       long callbackGapEvents, requestedFrames, suppliedFrames, sourceFrames;
@@ -532,7 +535,7 @@ namespace AudioBridge {
       public long SoftUnderrunCount { get { lock (gate) { return softUnderruns; } } }
       public long HardRebufferCount { get { lock (gate) { return hardRebuffers; } } }
       public long FreshnessTrimCount { get { lock (gate) { return freshnessTrims; } } }
-      public long FreshnessTrimOutageCount { get { lock (gate) { return freshnessTrimsOutage; } } }
+      public long FreshnessTrimTransitionCount { get { lock (gate) { return freshnessTrimsOutage; } } }
       // Bracket a deliberate endpoint teardown so any discard inside it is attributed to the
       // outage. Both take the same lock the render callback uses, so the flag can never be
       // observed half-set from the audio thread.
@@ -960,7 +963,7 @@ namespace AudioBridge {
           "render_req_p50_ms={34} render_req_p95_ms={35} render_req_p99_ms={36} " +
           "callback_gap_p50_ms={37:0.0} callback_gap_p95_ms={38:0.0} callback_gap_p99_ms={39:0.0} " +
           "device_buffer_ms={40} " +
-          "freshness_trim_device_reopen={41} freshness_trim_device_reopen_ms={42:0.0} " +
+          "freshness_trim_output_transition={41} freshness_trim_output_transition_ms={42:0.0} " +
           "output_notify_accepted={43} output_notify_ignored={44} output_reconcile_noop={45}",
           rxBytes, rxDurationMs, maxReadGapMs, occupancyMs,
           writeBeforeMs, writeAfterMs, spanMs, callbackMaxGapMs, callbackGaps,
@@ -1251,10 +1254,21 @@ namespace AudioBridge {
           if (chain == null && !policy.Idle && policy.ObservationSatisfied(readTicks) &&
               provider.BufferedFrames >= provider.PrebufferFrames) {
             reconcileRequested = false;
-            chain = OpenDefault(provider); // open AFTER prebuffer so first buffers are real audio
+            // The first open is an outage too: nothing drains the ring until the endpoint is
+            // live, so anything discarded here belongs to the transition, not to the network.
+            provider.BeginOutputOutage();
+            long openStart = Stopwatch.GetTimestamp();
+            try {
+              chain = OpenDefault(provider); // open AFTER prebuffer so first buffers are real audio
+            } finally {
+              provider.EndOutputOutage();
+            }
             outputGeneration++;
             endpoint = chain.Device.ID;
             activeEndpointId = endpoint;
+            Console.Error.WriteLine("event=output_open kind=cold_start open_ms=" +
+              ((Stopwatch.GetTimestamp() - openStart) * 1000.0 / Stopwatch.Frequency).ToString("0.0", CultureInfo.InvariantCulture) +
+              " endpoint=" + endpoint);
             reconcileRequested = false;    // discard anything our own open raised
           } else if (chain != null) {
             // Watchdog against over-filtering. If a notification we declined to act on did
@@ -1286,6 +1300,7 @@ namespace AudioBridge {
                 // network running late. Charging it to network freshness is what made a device
                 // problem read as a transport problem.
                 provider.BeginOutputOutage();
+                long reopenStart = Stopwatch.GetTimestamp();
                 try {
                   chain.Dispose();
                   chain = OpenDefault(provider);
@@ -1295,6 +1310,9 @@ namespace AudioBridge {
                 } finally {
                   provider.EndOutputOutage();
                 }
+                Console.Error.WriteLine("event=output_open kind=reopen open_ms=" +
+                  ((Stopwatch.GetTimestamp() - reopenStart) * 1000.0 / Stopwatch.Frequency).ToString("0.0", CultureInfo.InvariantCulture) +
+                  " endpoint=" + endpoint);
                 reconcileRequested = false;  // our own teardown/open must not re-trigger us
               }
             }
@@ -1519,8 +1537,8 @@ namespace AudioBridge {
       outage.EndOutputOutage();
       if (outage.FreshnessTrimCount == 0)
         throw new Exception("a stale backlog must still be trimmed during an outage");
-      if (outage.FreshnessTrimOutageCount != outage.FreshnessTrimCount)
-        throw new Exception("a trim during an output outage must be attributed to the outage");
+      if (outage.FreshnessTrimTransitionCount != outage.FreshnessTrimCount)
+        throw new Exception("a trim during an output transition must be attributed to the transition");
 
       // A silent gap must hand back latency the measurement no longer justifies, at once.
       // Crawling down at 5 ms per 10 s through a gap where nothing is playing kept ~200 ms
