@@ -312,6 +312,10 @@ namespace AudioBridge {
 
       // ResetForConnection clears everything a new TCP connection must not inherit. The learned
       // windows go too: a new stream has not been measured yet.
+      // ResetColdObservation forgets that program was ever seen. Confirmation-era reads must not
+      // count toward the gate that opens the output for the NEXT talkspurt.
+      public void ResetColdObservation() { firstActiveTicks = 0; activeReads = 0; }
+
       public void ResetForConnection() {
         lastReadTicks = 0; epochTicks = 0; suspendTicks = 0; firstActiveTicks = 0;
         activeReads = 0; outstandingDebtFrames = 0; oneSecondPeakFrames = 0;
@@ -557,6 +561,20 @@ namespace AudioBridge {
       public long SoftUnderrunCount { get { lock (gate) { return softUnderruns; } } }
       public long HardRebufferCount { get { lock (gate) { return hardRebuffers; } } }
       public long FreshnessTrimCount { get { lock (gate) { return freshnessTrims; } } }
+      // ClearForColdStart drops audio buffered before a confirmed silence when the output was
+      // never opened. Keeping it would play a fragment of an old phrase seconds later, after
+      // the next talkspurt -- stale audio nobody asked for. Freshness, not tidiness.
+      public void ClearForColdStart() {
+        lock (gate) {
+          head = 0; frames = 0; phase = 0;
+          readSerial = writeSerial;
+          markerHead = markerCount = 0;
+          mode = RenderMode.ActivePlaying;
+          rebuffering = true;
+          softPending = false;
+          integralMsSeconds = 0;
+        }
+      }
       public int RenderModeForTest { get { lock (gate) { return (int)mode; } } }
       public long IdleSilenceFrames { get { lock (gate) { return idleSilenceFrames; } } }
       public long ResumeWaitFrames { get { lock (gate) { return resumeWaitFrames; } } }
@@ -910,10 +928,11 @@ namespace AudioBridge {
             }
             ConsumeDueMarkersLocked();
             // The interpolator needs one frame of lookahead, so it can never consume the final
-            // frame before the boundary and the drain would stall a frame short forever, never
-            // crossing. Once no further progress is possible, step over the residue -- at most
-            // one frame, ~21 microseconds -- so the boundary is actually reached.
-            if (mode == RenderMode.DrainToIdle && drainable == 0 && markerCount > 0) {
+            // frame before a boundary: the drain would stall a frame short forever and never
+            // cross. Step over that residue -- at most one frame, ~21 microseconds -- in the
+            // same callback that rendered the prefix, so a boundary landing mid-request is
+            // crossed there rather than a whole request later.
+            if (mode == RenderMode.DrainToIdle && markerCount > 0) {
               long residue = markers[markerHead].Serial - readSerial;
               if (residue > 0 && residue <= 2) { Advance((int)residue); ConsumeDueMarkersLocked(); }
             }
@@ -1415,6 +1434,24 @@ namespace AudioBridge {
       public string TakeDescription() { lock (gate) { return description; } }
     }
 
+    // OnConfirmedEntry is the whole decision taken when the source is confirmed silent, factored
+    // out so the branch itself is under test rather than only the two methods it calls.
+    //
+    // With the output open the boundary goes into the audio and playback drains to it. With the
+    // output never opened there is no listener to drain to, so buffered pre-silence audio is
+    // merely stale: keeping it would play a fragment of an old phrase after the next talkspurt,
+    // a silence of arbitrary length later. The observation is forgotten with it, or the next
+    // talkspurt would open on evidence gathered before that silence.
+    static void OnConfirmedEntry(AdaptivePlayout provider, ArrivalPolicy policy,
+                                 bool outputOpen, long transitionId) {
+      if (outputOpen) {
+        provider.MarkIdleStart(transitionId);
+      } else {
+        provider.ClearForColdStart();
+        policy.ResetColdObservation();
+      }
+    }
+
     static void RunPlay(NetworkStream net) {
       var provider = new AdaptivePlayout();
       var policy = new ArrivalPolicy();
@@ -1507,9 +1544,7 @@ namespace AudioBridge {
               policy.SuspendDebt(readTicks);
               policy.ApplyIdleTarget(provider.RequestQuantumFrames);
               provider.PublishTarget(policy.PrebufferMs);
-              // Placed AFTER the threshold frame was inserted, so the boundary sits exactly
-              // where the source went quiet rather than wherever playback happens to be.
-              provider.MarkIdleStart(++sourceTransitionId);
+              OnConfirmedEntry(provider, policy, chain != null, ++sourceTransitionId);
             }
           }
           if (!classifier.Confirmed && spanCount > 0) {
@@ -1678,6 +1713,8 @@ namespace AudioBridge {
     }
 
     static void RunSelfTest() {
+      long perSec = Stopwatch.Frequency;
+      const int HysteresisForTest = 20;
       // R6: a partial frame advances nothing. One, two or three bytes must not classify, must
       // not move the arrival clock, and must not start or finish qualification -- the final
       // byte completes exactly one frame. This is what makes a one-byte read and a coalesced
@@ -1858,11 +1895,133 @@ namespace AudioBridge {
             prov.MarkersCrossedIdleForTest);
       }
 
+      // A2: a boundary landing mid-request renders the prefix and zeroes the remainder, without
+      // charging the shortfall as starvation. Checking source state once per callback would
+      // either replay past the boundary or throw the prefix away.
+      {
+        var prov = new AdaptivePlayout();
+        prov.PublishTarget(Audio.MinPrebufferMs);
+        int prefix = 200;                                  // less than one 480-frame request
+        prov.AddFrames(MakeTone(prefix), 0, prefix * 4);
+        prov.MarkIdleStart(1);
+        byte[] outBuf = new byte[Audio.Frames(10) * 4];
+        prov.Read(outBuf, 0, outBuf.Length);
+        if (prov.SuppliedFramesForTest < prefix - 2 || prov.SuppliedFramesForTest > prefix)
+          throw new Exception("a mid-request boundary must render exactly the prefix, got " +
+            prov.SuppliedFramesForTest + " of " + prefix);
+        if (prov.SoftUnderrunCount != 0 || prov.HardRebufferCount != 0)
+          throw new Exception("the zeroed remainder after a boundary is not starvation");
+        if (prov.RenderModeForTest != (int)RenderMode.IdleSilence)
+          throw new Exception("a mid-request boundary must still be crossed");
+      }
+
+      // A5: a freshness trim advances the read position and can step over boundaries. If it
+      // does so without applying them, render state no longer matches the first retained frame.
+      {
+        var prov = new AdaptivePlayout();
+        prov.PublishTarget(Audio.MinPrebufferMs);
+        int some = Audio.Frames(30);
+        prov.AddFrames(MakeTone(some), 0, some * 4);
+        prov.MarkIdleStart(1);
+        if (prov.RenderModeForTest != (int)RenderMode.DrainToIdle)
+          throw new Exception("the fixture must start in drain, else the trim proves nothing");
+        int trimBurst = Audio.Frames(Audio.MinPrebufferMs + 400);        // forces a trim
+        prov.AddFrames(MakeTone(trimBurst), 0, trimBurst * 4);
+        if (prov.FreshnessTrimCount == 0)
+          throw new Exception("the fixture must actually trim, else A5 is vacuous");
+        if (prov.RenderModeForTest == (int)RenderMode.DrainToIdle)
+          throw new Exception("a trim that steps over a boundary must apply it, not leave it behind");
+      }
+
+      // C1/C2: a receiver whose output never opened must not keep a fragment of an old phrase
+      // across a silence and play it after the next talkspurt, and must not open the output on
+      // observations gathered before that silence.
+      {
+        var prov = new AdaptivePlayout();
+        var pol = new ArrivalPolicy(); var cls = new SourceClassifier();
+        var sp = new SourceSpan[64];
+        long t = Stopwatch.GetTimestamp();
+        byte[] program = BuildStream(2000, 0, 0);
+        for (int i = 0; i < 4; i++) {          // the cold gate needs several active reads
+          t += (long)(0.042 * perSec);
+          DriveRead(pol, cls, sp, t, program, 0, program.Length);
+          prov.AddFrames(program, 0, program.Length);
+        }
+        if (!pol.ObservationSatisfied(t))
+          throw new Exception("program must satisfy the cold observation, else C1 is vacuous");
+        if (prov.BufferedFrames == 0)
+          throw new Exception("the fixture must have buffered audio, else C1 is vacuous");
+        OnConfirmedEntry(prov, pol, false, 1);        // the production branch, output closed
+        if (prov.BufferedFrames != 0)
+          throw new Exception("a never-opened receiver must drop pre-silence audio, not replay it late");
+        if (pol.ObservationSatisfied(t))
+          throw new Exception("confirmation-era observation must not open the output for the next talkspurt");
+        // Teeth: with the output OPEN the same entry must place a boundary and keep the audio,
+        // or this check would pass on a branch that simply always cleared.
+        var openProv = new AdaptivePlayout();
+        openProv.PublishTarget(Audio.MinPrebufferMs);
+        openProv.AddFrames(program, 0, program.Length);
+        OnConfirmedEntry(openProv, new ArrivalPolicy(), true, 1);
+        if (openProv.BufferedFrames == 0)
+          throw new Exception("with the output open, pre-silence audio must be drained, not dropped");
+        if (openProv.RenderModeForTest != (int)RenderMode.DrainToIdle)
+          throw new Exception("with the output open, confirmation must place a drain boundary");
+      }
+
+      // R9: confirmation and resumption inside ONE assembled read. Stream order must still give
+      // exactly one enter, one exit, a new debt epoch, and no lost active frame.
+      {
+        var pol = new ArrivalPolicy(); var cls = new SourceClassifier();
+        var sp = new SourceSpan[64];
+        long t = Stopwatch.GetTimestamp();
+        long epochBefore = pol.DebtEpoch;
+        byte[] both = BuildStream(0, SquelchProfile.ConfirmFrames, 480);
+        int inserted = 0, activeInserted = 0;
+        bool gapConfirmed = cls.Confirmed;
+        pol.OnGap(t, gapConfirmed, 1.0);
+        int n = cls.Scan(both, 0, both.Length, sp);
+        for (int i = 0; i < n; i++) {
+          if (sp[i].Edge == SourceEdge.Resumed) pol.ResumeDebt(t);
+          if (sp[i].Insert) { inserted += sp[i].Bytes / SquelchProfile.FrameBytes;
+                              if (sp[i].Active) activeInserted += sp[i].Bytes / SquelchProfile.FrameBytes; }
+          pol.OnMedia(t, sp[i].Bytes / SquelchProfile.FrameBytes, sp[i].Active);
+          if (sp[i].Edge == SourceEdge.Confirmed) pol.SuspendDebt(t);
+        }
+        if (pol.SquelchEnterCount != 1 || pol.SquelchExitCount != 1)
+          throw new Exception("one read crossing both boundaries must count one enter and one exit, got " +
+            pol.SquelchEnterCount + "/" + pol.SquelchExitCount);
+        if (pol.DebtEpoch != epochBefore + 1)
+          throw new Exception("resuming must open exactly one new debt epoch");
+        if (activeInserted != 480)
+          throw new Exception("every active frame must survive the crossing, inserted " + activeInserted);
+        if (inserted != SquelchProfile.ConfirmFrames + 480)
+          throw new Exception("qualifying media and the talkspurt must both be inserted, got " + inserted);
+      }
+
+      // P3: an arm that the evidence no longer supports expires at confirmation; one it still
+      // supports survives to be adopted at the talkspurt.
+      {
+        var pol = new ArrivalPolicy(); var cls = new SourceClassifier();
+        var sp = new SourceSpan[64];
+        long t = Stopwatch.GetTimestamp();
+        byte[] bursty = BuildStream(9600, 0, 0);
+        for (int i = 0; i < 60; i++) {
+          t += (long)(0.200 * perSec);
+          DriveRead(pol, cls, sp, t, bursty, 0, bursty.Length);
+          pol.Recompute(t, Audio.Frames(10), false);
+        }
+        int warranted = pol.WarrantedForTest(Audio.Frames(10));
+        if (warranted <= Audio.MinPrebufferMs)
+          throw new Exception("the P3 fixture must warrant a raise, else it proves nothing");
+        pol.ApplyIdleTarget(Audio.Frames(10));
+        if (pol.PrebufferMs < Audio.MinPrebufferMs)
+          throw new Exception("a still-warranted target must not be discarded at confirmation");
+      }
+
       // ---- arrival accounting, driven exactly as production drives it ------------------
       // These replace the old keepalive-era suite. Source state is no longer a Boolean this
       // class owns, and "was the last read silent" is no longer evidence of anything.
-      long perSec = Stopwatch.Frequency;
-      const int HysteresisForTest = 20;
+
 
       // R7: every frame transmitted before confirmation is media and pays down debt, silent or
       // not. The retired rule that only program audio carried lateness is what made an
