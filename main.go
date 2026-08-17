@@ -18,8 +18,9 @@ var assets embed.FS
 var bindingsMode bool
 
 // One binary, two modes:
-//   (no args)  -> headless daemon: owns the bridge + a tray/menubar icon, NO WebView (low RAM).
-//   --window   -> the Wails config window (a thin client to the daemon); frees its WebView on close.
+//
+//	(no args)  -> headless daemon: owns the bridge + a tray/menubar icon, NO WebView (low RAM).
+//	--window   -> the Wails config window (a thin client to the daemon); frees its WebView on close.
 func main() {
 	if bindingsMode || (len(os.Args) > 1 && os.Args[1] == "--window") {
 		runWindow()
