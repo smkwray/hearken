@@ -46,7 +46,9 @@ powershell -ExecutionPolicy Bypass -File install\install-windows.ps1   # builds 
 
 ## Use
 
-1. Click the **menubar/tray icon → Open hearken**.
+1. Click the **menubar/tray icon → Open hearken**. On macOS you can also just launch hearken the
+   usual way — Spotlight, Raycast, Launchpad or `open -a` — which brings up the same config
+   window rather than starting a second copy.
 2. Pick **roles**: one machine is **Host** (listens), the other **Client** (dials in). *Auto*
    makes macOS the host and everything else the client.
 3. On the **client**, set the host's address — press **Scan** to auto-find hearken hosts on your
