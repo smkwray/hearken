@@ -106,9 +106,15 @@ func (a *App) dispatch(m string, args []json.RawMessage) any {
 func openWindow() {
 	exe, err := os.Executable()
 	if err != nil {
+		logf("open window: cannot resolve own path: %v", err)
 		return
 	}
-	_ = exec.Command(exe, "--window").Start()
+	cmd := exec.Command(exe, "--window")
+	if err := cmd.Start(); err != nil {
+		logf("open window: %v", err)
+		return
+	}
+	go cmd.Wait() // reap it; otherwise every closed window leaves a zombie child
 }
 
 func runTray(app *App) {
@@ -119,6 +125,7 @@ func runTray(app *App) {
 			systray.SetTemplateIcon(menubarGlyph, menubarGlyph) // macOS adapts to light/dark
 		}
 		systray.SetTooltip("hearken")
+		installReopenHandler()
 		mStatus := systray.AddMenuItem("starting…", "")
 		mStatus.Disable()
 		mOpen := systray.AddMenuItem("Open hearken", "Open the config window")
@@ -138,6 +145,11 @@ func runTray(app *App) {
 			}
 		}()
 		go func() {
+			// Avoid a synchronous AppKit menu-item update every 2s when the
+			// displayed state is unchanged. The observed hang was in AppKit /
+			// FrontBoard while drawing the status item; the process sample did
+			// not establish these menu updates as its cause.
+			prev := ""
 			for {
 				s := app.GetStatus()
 				t := "Idle"
@@ -148,7 +160,10 @@ func runTray(app *App) {
 						t = "Streaming · waiting for peer"
 					}
 				}
-				mStatus.SetTitle(t)
+				if t != prev {
+					prev = t
+					mStatus.SetTitle(t)
+				}
 				time.Sleep(2 * time.Second)
 			}
 		}()
