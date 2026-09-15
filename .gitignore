@@ -11,6 +11,7 @@ CLAUDE.md
 *.plan.md
 .env
 .env.*
+.private-denylist
 .worktrees/
 *.log
 
