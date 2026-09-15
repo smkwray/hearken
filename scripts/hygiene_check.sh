@@ -5,8 +5,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 MODE="repo"
+PUBLIC_CI=0
 if [[ "${1:-}" == "--staged" ]]; then
   MODE="staged"
+elif [[ "${1:-}" == "--public-ci" ]]; then
+  PUBLIC_CI=1
 elif [[ -n "${1:-}" ]]; then
   echo "hygiene_check: unknown argument: $1" >&2
   exit 2
@@ -91,25 +94,12 @@ if ! python3 scripts/gen-squelch-profile.py --check; then
   violations=$((violations + 1))
 fi
 
-# The generic source scan omits this checker because it names its own patterns.
-# This exact scan does not: real maintainer identifiers remain in an ignored file
-# and are checked against every tracked file, including this one.
-DENYLIST=""
-for candidate in .private-denylist .*-private-denylist; do
-  [[ -f "$candidate" ]] && DENYLIST="$candidate" && break
-done
-if [[ -z "$DENYLIST" || ! -s "$DENYLIST" ]]; then
-  echo "hygiene_check: FAIL — a nonempty ignored private denylist is required." >&2
-  violations=$((violations + 1))
+if [[ "$PUBLIC_CI" -eq 1 ]]; then
+  python3 scripts/privacy_gate.py --public-ci || violations=$((violations + 1))
+elif [[ "$MODE" == "staged" ]]; then
+  python3 scripts/privacy_gate.py --require-private --cached || violations=$((violations + 1))
 else
-  while IFS= read -r term; do
-    [[ -z "$term" || "$term" == \#* ]] && continue
-    if hits="$(git grep -n -I -F -- "$term" 2>/dev/null)"; then
-      echo "hygiene_check: FAIL — private denylist match:" >&2
-      printf '%s\n' "$hits" >&2
-      violations=$((violations + 1))
-    fi
-  done < "$DENYLIST"
+  python3 scripts/privacy_gate.py --require-private --repo || violations=$((violations + 1))
 fi
 
 if [[ "$violations" -gt 0 ]]; then
