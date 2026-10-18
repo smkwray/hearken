@@ -437,7 +437,7 @@ func startSender(_ fd: Int32) {
     let generation = senderGeneration
     sendCond.unlock()
     let sender = Thread {
-        FileHandle.standardError.write("event=worker_scheduling worker=sender requested_qos=user_initiated effective_qos=\(qos_class_self().rawValue)\n".data(using: .utf8)!)
+        FileHandle.standardError.write("event=worker_scheduling worker=sender requested_qos=user_initiated reported_qos_class=\(qos_class_self().rawValue)\n".data(using: .utf8)!)
         // One drain buffer per sender thread, allocated here — on the sender thread, never on the
         // callback — and big enough for the whole ring, so a drain is one memcpy that empties the
         // queue under the lock exactly as `removeAll` emptied the Data queue.
