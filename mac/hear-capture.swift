@@ -436,7 +436,8 @@ func startSender(_ fd: Int32) {
     senderGeneration &+= 1
     let generation = senderGeneration
     sendCond.unlock()
-    Thread.detachNewThread {
+    let sender = Thread {
+        FileHandle.standardError.write("event=worker_scheduling worker=sender requested_qos=user_initiated effective_qos=\(qos_class_self().rawValue)\n".data(using: .utf8)!)
         // One drain buffer per sender thread, allocated here — on the sender thread, never on the
         // callback — and big enough for the whole ring, so a drain is one memcpy that empties the
         // queue under the lock exactly as `removeAll` emptied the Data queue.
@@ -483,6 +484,12 @@ func startSender(_ fd: Int32) {
             }
         }
     }
+    // Deliver captured audio promptly under CPU contention. This worker can block on TCP,
+    // so use ordinary QoS, never a real-time audio scheduling policy. Telemetry stays at
+    // its existing priority, and capture/render scheduling belongs to CoreAudio.
+    sender.name = "hearken.sender"
+    sender.qualityOfService = .userInitiated
+    sender.start()
     // Telemetry clock. It sleeps rather than waiting on sendCond: a second waiter there
     // could swallow the signal() meant for the sender and delay real audio. The
     // generation check retires this thread when the connection ends — a reconnect inside

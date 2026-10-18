@@ -17,6 +17,10 @@ namespace AudioBridge {
   // Usage: capture.exe <host> <port>
   class Capture {
     static void Main(string[] args) {
+      // Boost this resample/send worker only; keep the process class and NAudio's capture
+      // thread unchanged. Blocking socket I/O must not use a real-time scheduling policy.
+      Thread.CurrentThread.Priority = ThreadPriority.AboveNormal;
+      Console.Error.WriteLine("event=worker_scheduling worker=sender priority=" + Thread.CurrentThread.Priority);
       string host = args.Length > 0 ? args[0] : "127.0.0.1";
       int port = args.Length > 1 ? int.Parse(args[1]) : 45001;
       MediaFoundationApi.Startup();

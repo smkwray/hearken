@@ -97,6 +97,10 @@ namespace AudioBridge {
         RunSelfTest();
         return;
       }
+      // Favor the network/media worker under contention without raising the process class
+      // or changing NAudio's render-thread scheduling. Blocking socket I/O is not real-time work.
+      Thread.CurrentThread.Priority = ThreadPriority.AboveNormal;
+      Console.Error.WriteLine("event=worker_scheduling worker=receiver priority=" + Thread.CurrentThread.Priority);
       string host = args.Length > 0 ? args[0] : "127.0.0.1";
       int port = args.Length > 1 ? int.Parse(args[1]) : 45000;
       if (args.Length > 2) { float g; if (float.TryParse(args[2], out g)) gGain = g < 0 ? 0 : (g > 1 ? 1 : g); }
