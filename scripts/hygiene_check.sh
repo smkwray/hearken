@@ -10,6 +10,13 @@ if [[ "${1:-}" == "--staged" ]]; then
   MODE="staged"
 elif [[ "${1:-}" == "--public-ci" ]]; then
   PUBLIC_CI=1
+elif [[ "${1:-}" == "--controls" ]]; then
+  # Control-file integrity for the untracked maintainer surface; the staged scan cannot see it.
+  if [[ -f scripts/control_check.py ]]; then
+    exec python3 scripts/control_check.py "$ROOT"
+  fi
+  echo "hygiene_check: scripts/control_check.py missing; control gate cannot run." >&2
+  exit 1
 elif [[ -n "${1:-}" ]]; then
   echo "hygiene_check: unknown argument: $1" >&2
   exit 2

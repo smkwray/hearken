@@ -13,6 +13,7 @@ CLAUDE.md
 .env.*
 .private-denylist
 .worktrees/
+.claude/
 *.log
 
 # compiled native helpers (built by install/build scripts; sources are tracked)
