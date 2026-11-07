@@ -145,6 +145,7 @@ type App struct {
 	cancel      context.CancelFunc
 	wg          sync.WaitGroup
 	logMu       sync.Mutex
+	childLog    childLog // guarded by logMu
 	note        string
 	bridgeStart time.Time
 	daemon      string       // "" = run the bridge locally (daemon mode); non-"" = proxy to that URL (window mode)
@@ -273,16 +274,75 @@ func run(timeout time.Duration, name string, args ...string) (string, error) {
 	return string(out), err
 }
 
-const maxLogBytes = 10 << 20 // rotate hearken.log at 10MB (one .old kept)
+var maxLogBytes int64 = 10 << 20 // rotate hearken.log at 10MB (one .old kept)
 
 // rotateLog caps the log by renaming it to hearken.log.old once it exceeds
-// maxLogBytes. Called at open time only, so a long-lived child writing to an
-// already-open handle can overshoot until it next respawns.
+// maxLogBytes. On Windows the rename fails while another handle holds the
+// file, which is why all children share one handle (childLog).
 func rotateLog(path string) {
 	if fi, err := os.Stat(path); err == nil && fi.Size() > maxLogBytes {
 		os.Remove(path + ".old")
 		os.Rename(path, path+".old")
 	}
+}
+
+// childLog is the single handle every supervised child writes telemetry
+// through. Go opens files on Windows without FILE_SHARE_DELETE, so with one
+// handle per child the rename in rotateLog always failed while both legs ran
+// and the log grew without bound.
+type childLog struct {
+	path string
+	f    *os.File
+	refs int
+}
+
+func (a *App) openChildLog(path string) error {
+	a.logMu.Lock()
+	defer a.logMu.Unlock()
+	l := &a.childLog
+	if l.f != nil && l.path != path {
+		l.f.Close()
+		l.f = nil
+	}
+	if l.f == nil {
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			return err
+		}
+		l.path, l.f = path, f
+	}
+	l.refs++
+	return nil
+}
+
+func (a *App) closeChildLog() {
+	a.logMu.Lock()
+	defer a.logMu.Unlock()
+	l := &a.childLog
+	if l.refs--; l.refs <= 0 && l.f != nil {
+		l.f.Close()
+		l.f, l.refs = nil, 0
+	}
+}
+
+// keepChildLogCurrentLocked rotates the shared handle once it passes
+// maxLogBytes, and reopens it when the path no longer names its file (logf or
+// anything else renamed it), so writes never land in .old. Caller holds logMu.
+func (a *App) keepChildLogCurrentLocked() {
+	l := &a.childLog
+	if l.f == nil {
+		return
+	}
+	fi, err := l.f.Stat()
+	if err != nil {
+		return
+	}
+	if pi, err := os.Stat(l.path); err == nil && os.SameFile(fi, pi) && fi.Size() <= maxLogBytes {
+		return
+	}
+	l.f.Close()
+	rotateLog(l.path)
+	l.f, _ = os.OpenFile(l.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 }
 
 func logf(format string, args ...any) {
@@ -759,22 +819,26 @@ func growWait(d time.Duration) time.Duration {
 	return d
 }
 
-func (a *App) writeChildLine(f *os.File, bridgeStart time.Time, r role, generation, pid int, streamID, source, line string) {
+func (a *App) writeChildLine(bridgeStart time.Time, r role, generation, pid int, streamID, source, line string) {
 	a.logMu.Lock()
 	defer a.logMu.Unlock()
-	fmt.Fprintf(f, "wall=%s mono_ns=%d role=%s pid=%d generation=%d stream=%s source=%s msg=%s\n",
+	a.keepChildLogCurrentLocked()
+	if a.childLog.f == nil {
+		return
+	}
+	fmt.Fprintf(a.childLog.f, "wall=%s mono_ns=%d role=%s pid=%d generation=%d stream=%s source=%s msg=%s\n",
 		time.Now().UTC().Format(time.RFC3339Nano), time.Since(bridgeStart).Nanoseconds(), r.label(),
 		pid, generation, streamID, source, strconv.Quote(line))
 }
 
-func (a *App) pumpChildLines(f *os.File, bridgeStart time.Time, r role, generation, pid int, streamID, source string, scanner *bufio.Scanner, done *sync.WaitGroup) {
+func (a *App) pumpChildLines(bridgeStart time.Time, r role, generation, pid int, streamID, source string, scanner *bufio.Scanner, done *sync.WaitGroup) {
 	defer done.Done()
 	scanner.Buffer(make([]byte, 4096), 1<<20)
 	for scanner.Scan() {
-		a.writeChildLine(f, bridgeStart, r, generation, pid, streamID, source, scanner.Text())
+		a.writeChildLine(bridgeStart, r, generation, pid, streamID, source, scanner.Text())
 	}
 	if err := scanner.Err(); err != nil {
-		a.writeChildLine(f, bridgeStart, r, generation, pid, streamID, "supervisor", "line_pump_error source="+source+" error="+err.Error())
+		a.writeChildLine(bridgeStart, r, generation, pid, streamID, "supervisor", "line_pump_error source="+source+" error="+err.Error())
 	}
 }
 
@@ -817,11 +881,10 @@ func (a *App) runChildWithTelemetry(cmd *exec.Cmd, logPath string, r role, gener
 	if err != nil {
 		return fmt.Errorf("stderr pipe: %w", err)
 	}
-	lf, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
+	if err := a.openChildLog(logPath); err != nil {
 		return fmt.Errorf("open child log: %w", err)
 	}
-	defer lf.Close()
+	defer a.closeChildLog()
 	if err := cmd.Start(); err != nil {
 		return err
 	}
@@ -833,11 +896,11 @@ func (a *App) runChildWithTelemetry(cmd *exec.Cmd, logPath string, r role, gener
 	streamID := fmt.Sprintf("%s-%d-%d", r.label(), generation, time.Now().UnixNano())
 	var pumps sync.WaitGroup
 	pumps.Add(2)
-	go a.pumpChildLines(lf, bridgeStart, r, generation, pid, streamID, "stdout", bufio.NewScanner(stdout), &pumps)
-	go a.pumpChildLines(lf, bridgeStart, r, generation, pid, streamID, "stderr", bufio.NewScanner(stderr), &pumps)
-	a.writeChildLine(lf, bridgeStart, r, generation, pid, streamID, "supervisor", "event=child_started")
+	go a.pumpChildLines(bridgeStart, r, generation, pid, streamID, "stdout", bufio.NewScanner(stdout), &pumps)
+	go a.pumpChildLines(bridgeStart, r, generation, pid, streamID, "stderr", bufio.NewScanner(stderr), &pumps)
+	a.writeChildLine(bridgeStart, r, generation, pid, streamID, "supervisor", "event=child_started")
 	if peer != "" {
-		a.writeChildLine(lf, bridgeStart, r, generation, pid, streamID, "supervisor", "event=path path="+pathType(peer)+" peer="+peer)
+		a.writeChildLine(bridgeStart, r, generation, pid, streamID, "supervisor", "event=path path="+pathType(peer)+" peer="+peer)
 	}
 	err = cmd.Wait()
 	pumps.Wait()
@@ -880,7 +943,6 @@ func (a *App) supervise(ctx context.Context, r role, cfg Config) {
 		logf("supervise role=%s generation=%d exec=%s args=%v", r.label(), generation, cmd.Path, cmd.Args[1:])
 		d, _ := os.UserConfigDir()
 		lp := filepath.Join(d, "hearken", "hearken.log")
-		rotateLog(lp)
 		started := time.Now()
 		err := a.runChildWithTelemetry(cmd, lp, r, generation, cfg.PeerIP)
 		logf("supervise role=%s generation=%d exited after %v err=%v", r.label(), generation, time.Since(started).Round(time.Millisecond), err)
