@@ -25,7 +25,7 @@ fi
 say "2/7  Compile native helpers -> $AB"
 command -v swiftc >/dev/null || { echo "Xcode CLT missing — run 'xcode-select --install' then re-run." >&2; exit 1; }
 bash "$REPO/mac/build.sh"   # compiles with the right -framework flags
-for f in hear-capture make-bridge-out find-output-index setdef; do
+for f in hear-play hear-capture make-bridge-out find-output-index setdef; do
   [ -f "$REPO/mac/$f" ] && cp "$REPO/mac/$f" "$AB/$f" && echo "  installed $AB/$f"
 done
 

@@ -18,6 +18,7 @@ CLAUDE.md
 
 # compiled native helpers (built by install/build scripts; sources are tracked)
 mac/hear-capture
+mac/hear-play
 mac/find-output-index
 mac/make-bridge-out
 mac/setdef

@@ -196,10 +196,13 @@ func (a *App) shutdown(ctx context.Context) {
 // autoStart launches the bridge if configured. Called by the DAEMON at startup
 // (host always; client once a peer IP is set).
 func (a *App) autoStart() {
-	deps := a.CheckDeps()
-	logf("daemon startup os=%s home=%s abDir=%s autostart=%v deps=%v", runtime.GOOS, home(), abDir(), a.cfg.AutoStart, deps)
-	if a.cfg.AutoStart && len(deps) == 0 {
-		if isHost(a.cfg) || a.cfg.PeerIP != "" {
+	a.mu.Lock()
+	cfg := a.cfg
+	a.mu.Unlock()
+	deps := checkDeps(cfg)
+	logf("daemon startup os=%s home=%s abDir=%s autostart=%v deps=%v", runtime.GOOS, home(), abDir(), cfg.AutoStart, deps)
+	if cfg.AutoStart && len(deps) == 0 {
+		if isHost(cfg) || cfg.PeerIP != "" {
 			go a.Start()
 		}
 	}
@@ -383,8 +386,29 @@ func (a *App) saveConfig() {
 
 // ---- dependency detection ----------------------------------------------
 
-// CheckDeps returns the list of missing dependencies for this OS.
+func receiveOnlyMacHost(cfg Config) bool {
+	hostAudio, _ := legsForDirection(cfg.Direction)
+	return runtime.GOOS == "darwin" && isHost(cfg) && !hostAudio
+}
+
+// CheckDeps returns the dependencies missing for the configured direction.
 func (a *App) CheckDeps() []string {
+	if a.daemon != "" {
+		return a.GetStatus().MissingDeps
+	}
+	a.mu.Lock()
+	cfg := a.cfg
+	a.mu.Unlock()
+	return checkDeps(cfg)
+}
+
+func checkDeps(cfg Config) []string {
+	if receiveOnlyMacHost(cfg) {
+		if !exists(filepath.Join(abDir(), "hear-play")) {
+			return []string{"hear-play"}
+		}
+		return nil
+	}
 	var miss []string
 	if runtime.GOOS == "darwin" {
 		if !exists("/Library/Audio/Plug-Ins/HAL/BlackHole2ch.driver") {
@@ -467,7 +491,7 @@ func (a *App) GetStatus() Status {
 		Direction: cfg.Direction, SndBufKB: cfg.SndBufKB, CaptureMs: cfg.CaptureMs,
 		RecvBufKB: cfg.RecvBufKB, PlayoutMs: cfg.PlayoutMs, VolumePct: cfg.VolumePct,
 		PeerTimeoutMs: peerTimeoutUs(cfg) / 1000, AutoStart: cfg.AutoStart,
-		MissingDeps: a.CheckDeps(), Note: note,
+		MissingDeps: checkDeps(cfg), Note: note,
 	}
 	s.Role = roleName(cfg)
 	s.RoleMode = cfg.Role
@@ -762,7 +786,7 @@ func (a *App) Start() string {
 		a.mu.Unlock()
 		return "Set the host's IP first."
 	}
-	if m := a.CheckDeps(); len(m) > 0 {
+	if m := checkDeps(cfg); len(m) > 0 {
 		a.mu.Unlock()
 		return "Missing dependencies: " + strings.Join(m, ", ")
 	}
@@ -1003,6 +1027,14 @@ func (a *App) buildCmd(ctx context.Context, r role, cfg Config) (*exec.Cmd, bool
 
 	case roleHostPlayServe: // listen on talkPort, play received audio
 		if mac {
+			if receiveOnlyMacHost(cfg) {
+				addr := os.Getenv("HEARKEN_PLAY_BIND_IP")
+				if addr == "" {
+					addr = "0.0.0.0"
+				}
+				return exec.CommandContext(ctx, filepath.Join(abDir(), "hear-play"), addr,
+					strconv.Itoa(talkPort), strconv.Itoa(peerTimeoutUs(cfg)/1000), gainArg(cfg)), true
+			}
 			// timeout: the sender keepalives every ≤2s even while squelched, so a silent
 			// link for longer than this = half-open (peer slept/vanished). ffmpeg exits,
 			// the supervisor relaunches it, and it listens again. Without it, one stale

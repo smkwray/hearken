@@ -69,10 +69,25 @@ namespace AudioBridge {
       return true;
     }
 
+    // The transform accepts partial input blocks. Cap its read-ahead on formats
+    // that actually need resampling or channel conversion.
+    sealed class ShortReads : IWaveProvider {
+      readonly IWaveProvider source;
+      readonly int block;
+      public ShortReads(IWaveProvider source) {
+        this.source = source;
+        block = source.WaveFormat.ConvertLatencyToByteSize(20);
+      }
+      public WaveFormat WaveFormat { get { return source.WaveFormat; } }
+      public int Read(byte[] buffer, int offset, int count) {
+        return source.Read(buffer, offset, Math.Min(count, block));
+      }
+    }
+
     static void RunCapture(Stream outStream, WaveFormat outFmt) {
       var cap = new WasapiLoopbackCapture();
-      var srcFmt = WaveFormat.CreateIeeeFloatWaveFormat(cap.WaveFormat.SampleRate, cap.WaveFormat.Channels);
-      Console.Error.WriteLine("capturing " + srcFmt.SampleRate + "Hz/" + srcFmt.Channels + "ch float");
+      var srcFmt = cap.WaveFormat;
+      Console.Error.WriteLine("capturing " + srcFmt.SampleRate + "Hz/" + srcFmt.Channels + "ch " + srcFmt.Encoding);
       var buf = new BufferedWaveProvider(srcFmt) {
         BufferDuration = TimeSpan.FromSeconds(5),
         DiscardOnBufferOverflow = true,
@@ -81,7 +96,18 @@ namespace AudioBridge {
       cap.DataAvailable += (s, a) => { try { buf.AddSamples(a.Buffer, 0, a.BytesRecorded); } catch {} };
       var stop = new ManualResetEventSlim(false);
       cap.RecordingStopped += (s, a) => stop.Set();
-      using (var resampler = new MediaFoundationResampler(buf, outFmt) { ResamplerQuality = 60 }) {
+      // The usual stereo mix needs only a sample conversion. Asking the MF
+      // transform to read a live, zero-filling source a second at a time adds
+      // a second of silence and backlog even when no rate conversion is needed.
+      bool nativeStereo = srcFmt.SampleRate == outFmt.SampleRate && srcFmt.Channels == 2;
+      bool floatMix = srcFmt.Encoding == WaveFormatEncoding.IeeeFloat && srcFmt.BitsPerSample == 32;
+      bool pcmMix = srcFmt.Encoding == WaveFormatEncoding.Pcm && srcFmt.BitsPerSample == 16;
+      using (var resampler = nativeStereo && (floatMix || pcmMix) ? null :
+          new MediaFoundationResampler(new ShortReads(buf), outFmt) { ResamplerQuality = 60 }) {
+        IWaveProvider pcm = resampler;
+        if (resampler == null) {
+          pcm = floatMix ? (IWaveProvider)new WaveFloatTo16Provider(buf) : buf;
+        }
         cap.StartRecording();
         int bps = outFmt.AverageBytesPerSecond;
         int interval = 20;
@@ -104,7 +130,7 @@ namespace AudioBridge {
           while (!stop.IsSet) {
             long target = (long)(sw.Elapsed.TotalSeconds * bps);
             while (written < target) {
-              int n = resampler.Read(tmp, 0, tmp.Length);
+              int n = pcm.Read(tmp, 0, tmp.Length);
               if (n <= 0) break;
               written += n; // advance the clock regardless of whether we transmit
               long nowMs = sw.ElapsedMilliseconds;

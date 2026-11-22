@@ -54,6 +54,8 @@ powershell -ExecutionPolicy Bypass -File install\install-windows.ps1   # builds 
 3. On the **client**, set the host's address — press **Scan** to auto-find hearken hosts on your
    Tailscale/LAN, or type the IP shown under *"Others reach this device at…"* on the host. **Save.**
 4. Pick a **direction**: *Host→Client*, *Client→Host*, or *Both*, and set **Volume** to taste.
+   For Windows audio on a Mac, use *Client→Host* on both machines, then select the
+   headphones in macOS Sound → Output. Local and incoming audio share that output.
 5. Close the window — the daemon keeps running in the menubar/tray; the client auto-connects on
    every login thereafter.
 
@@ -64,6 +66,9 @@ hearken just streams raw PCM (s16le / 48 kHz / stereo) over TCP to whatever IP y
   prefers a direct LAN path. Install + log in on both, or
 - **Plain LAN**: type the host's `192.168.x` IP — no Tailscale needed (open the host's firewall
   for ports 45000/45001).
+
+On a receive-only Mac host, set `HEARKEN_PLAY_BIND_IP` in the daemon environment to bind the
+incoming playback socket to a single local IPv4 address, such as its VPN address.
 
 ## Dependencies & licenses
 
