@@ -2,7 +2,7 @@ import Foundation
 import CoreAudio
 
 let sys = AudioObjectID(kAudioObjectSystemObject)
-let BRIDGE_UID = "com.shane.bridgeout"
+let BRIDGE_UID = "hearken.bridgeout"
 let BRIDGE_NAME = "Bridge Out"
 
 func addr(_ sel: AudioObjectPropertySelector,
@@ -60,8 +60,11 @@ func setDefaultOutput(_ dev: AudioDeviceID) -> OSStatus {
     return AudioObjectSetPropertyData(sys, &a, 0, nil, UInt32(MemoryLayout<AudioDeviceID>.size), &d)
 }
 
-// 1) Destroy any prior Bridge Out so this is idempotent.
-for d in devices() where str(d, kAudioDevicePropertyDeviceUID) == BRIDGE_UID {
+// 1) Destroy any prior Bridge Out so this is idempotent (matched by UID, or by
+//    name for an aggregate created under an earlier UID).
+for d in devices() where str(d, kAudioDevicePropertyDeviceUID) == BRIDGE_UID ||
+    (str(d, kAudioObjectPropertyName) == BRIDGE_NAME &&
+     u32(d, kAudioDevicePropertyTransportType) == kAudioDeviceTransportTypeAggregate) {
     let st = AudioHardwareDestroyAggregateDevice(d)
     print("destroyed prior Bridge Out id=\(d) status=\(st)")
 }
@@ -85,7 +88,7 @@ let defUID = str(defOut, kAudioDevicePropertyDeviceUID)
 let defName = str(defOut, kAudioObjectPropertyName) ?? "?"
 var masterUID = builtinUID
 var masterName = builtinName
-if let d = defUID, d != blackholeUID, d != BRIDGE_UID, outChannels(defOut) > 0 {
+if let d = defUID, d != blackholeUID, d != BRIDGE_UID, defName != BRIDGE_NAME, outChannels(defOut) > 0 {
     masterUID = d; masterName = defName
 }
 

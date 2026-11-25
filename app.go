@@ -1118,13 +1118,10 @@ func (a *App) ensureBridgeOut() {
 	}
 }
 
-// disableLegacyServices unloads the old launchd agents / scheduled task so they
-// don't double-bind the ports against the app-managed children.
+// disableLegacyServices stops the old Windows scheduled task and sweeps orphaned
+// children so they don't double-bind the ports against the app-managed children.
 func (a *App) disableLegacyServices() {
 	if runtime.GOOS == "darwin" {
-		uid := strconv.Itoa(os.Getuid())
-		run(5*time.Second, "launchctl", "bootout", "gui/"+uid+"/com.shane.audiobridge.hear")
-		run(5*time.Second, "launchctl", "bootout", "gui/"+uid+"/com.shane.audiobridge.talk")
 		// sweep orphaned bridge children from a previously crashed/killed daemon
 		run(3*time.Second, "pkill", "-f", "hear-capture "+strconv.Itoa(hearPort))
 		run(3*time.Second, "pkill", "-f", fmt.Sprintf("tcp://0.0.0.0:%d", talkPort)) // note: arg is a regex; keep it metachar-free

@@ -31,7 +31,7 @@ var reals: [Cand] = []
 for (i,d) in ids.enumerated() where outCh(d) > 0 {
     let uid = str(d, kAudioDevicePropertyDeviceUID)
     let name = str(d, kAudioObjectPropertyName)
-    if uid == "BlackHole2ch_UID" || uid == "com.shane.bridgeout" { continue }
+    if uid == "BlackHole2ch_UID" || uid == "hearken.bridgeout" { continue }
     if name.lowercased().contains("blackhole") || name == "Bridge Out" { continue }
     reals.append(Cand(idx: i, uid: uid, name: name))
 }
